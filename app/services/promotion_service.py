@@ -350,7 +350,7 @@ class PromotionService:
         last_pending_usage = self.__promotion_usage_repo.select_procedure(
             function_name="get_latest_pending_promotion_usage_per_user",
             where={"p_user_id": user_id, "p_promotion_code": promotion.code,
-                   "p_window_seconds": 60 * 60 * 24})
+                   "p_window_seconds": int(get_config("PROMOTION_PENDING_LOCK_SECONDS", 60 * 60))})
         if last_pending_usage and len(last_pending_usage) > 0:
             raise CustomException(code=400, name=ErrorMessages.PROMOTION_ALREADY_IN_USE,
                                   details="Promotion code used too recently, please wait before reusing.")
@@ -385,7 +385,7 @@ class PromotionService:
             raise CustomException(code=400, name=ErrorMessages.USER_HAS_PREVIOUS_ESIM,
                                   details="User already purchased esim before, cannot use referral code")
         user_model: UsersCopyModel = self.__user_repo.get_by_id(user_id)
-        if user_model.metadata["referral_code"] and user_model.metadata["referral_code"] == promotion_code:
+        if user_model.metadata.get("referral_code") and user_model.metadata.get("referral_code") == promotion_code:
             raise CustomException(code=400, name=ErrorMessages.OWN_REFERRAL_CODE_CANNOT_BE_USED,
                                   details="Own Referral Code Can not be used")
 

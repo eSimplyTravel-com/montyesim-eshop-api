@@ -29,7 +29,8 @@ def create_payment_intent(user_bundle_order: UserOrderModel, user_email: str,
             customer = stripe.Customer.create(email=user_email)
         else:
             customer = customers.get("data")[0]
-        order_amount = user_bundle_order.modified_amount if user_bundle_order.modified_amount else user_bundle_order.amount
+        # modified_amount == 0 is a legitimate 100%-discount total and must NOT fall back to the list price
+        order_amount = user_bundle_order.modified_amount if user_bundle_order.modified_amount is not None else user_bundle_order.amount
         # Use Decimal to avoid float precision issues: order_amount is in cents
         rate_dec = Decimal(str(rate))
         order_amount_cents = Decimal(str(order_amount))

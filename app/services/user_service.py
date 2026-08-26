@@ -97,6 +97,11 @@ class UserBundleService:
                                                                                      order_id=order.id)
             logger.info(f"applying promo code {assign_request.promo_code} with {validation_response.message}")
             bundle = validation_response.bundle
+            # /validation runs bundle_currency_update after discounting; the assign path
+            # must too, or the discounted price_display serialised into bundle_data is a
+            # USD number labelled with the request currency (wrong string in receipts).
+            rate = self.__currency_service.get_rate_by_currency(x_currency)
+            bundle = DtoMapper.bundle_currency_update(bundle=bundle, rate=rate, currency=x_currency)
             modified_amount = bundle.original_price
             rule_id = validation_response.rule_id
             order.modified_amount = round(modified_amount * 100, 2)
@@ -707,7 +712,7 @@ class UserBundleService:
             raise CustomException(code=400, name=ErrorMessages.USER_HAS_PREVIOUS_ESIM,
                                   details="User already purchased esim before, cannot use referral code")
         user_model: UsersCopyModel = self.__user_repo.get_by_id(user.id)
-        if user_model.metadata["referral_code"] and user_model.metadata["referral_code"] == promo_code:
+        if user_model.metadata.get("referral_code") and user_model.metadata.get("referral_code") == promo_code:
             raise CustomException(code=400, name=ErrorMessages.OWN_REFERRAL_CODE_CANNOT_BE_USED,
                                   details="Own Referral Code Can not be used")
 
