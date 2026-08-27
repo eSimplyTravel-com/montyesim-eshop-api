@@ -31,6 +31,17 @@ class AssignRequest(BaseModel):
     affiliate_code: Optional[str]
     payment_type: Optional[PaymentTypeEnum] = PaymentTypeEnum.CARD
 
+    @field_validator("promo_code")
+    @classmethod
+    def normalize_promo_code(cls, value: Optional[str]) -> Optional[str]:
+        # Codes are stored uppercase; the DB lookup is byte-exact. Normalising
+        # here covers every client, so keyboard casing and stray whitespace
+        # cannot make a valid code miss.
+        if value is None:
+            return None
+        value = value.strip().upper()
+        return value or None
+
 
 class VerifyOtpRequestDto(BaseModel):
     otp: str

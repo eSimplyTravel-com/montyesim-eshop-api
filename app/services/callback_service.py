@@ -265,7 +265,8 @@ class CallbackService:
 
     def __handle_payment_webhook_data(self, event: dict):
         logger.debug(f"Received payment webhook.{event.get('type')}")
-        if event.get("type") not in [PaymentIntentEvents.SUCCEEDED, PaymentIntentEvents.FAILED]:
+        if event.get("type") not in [PaymentIntentEvents.SUCCEEDED, PaymentIntentEvents.FAILED,
+                                     PaymentIntentEvents.CANCELED]:
             logger.info(f"Ignoring payment intent {event.get('type')}")
             return ResponseHelper.success_response()
 
@@ -290,6 +291,8 @@ class CallbackService:
         tax_calculation = metadata.get("tax_calculation", None)
         user_order = self.__user_order_repo.get_by_id(order_id)
         bundle = BundleDTO.model_validate_json(user_order.bundle_data)
+        # canceled (abandoned/expired intents) releases the promo usage the same way a
+        # failed payment does — otherwise the pending row locks the user+code combination
         payment_status = OrderStatusEnum.SUCCESS if event.get(
             "type") == "payment_intent.succeeded" else OrderStatusEnum.FAILURE
         if payment_status == OrderStatusEnum.FAILURE:

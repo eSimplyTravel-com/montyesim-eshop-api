@@ -16,6 +16,13 @@ class PromotionValidationRequest(BaseModel):
     promo_code: str
     bundle_code: str
 
+    @field_validator("promo_code")
+    @classmethod
+    def normalize_promo_code(cls, value: str) -> str:
+        # Same normalisation as AssignRequest: storage is uppercase, lookup is
+        # byte-exact, and clients disagree about keyboard casing.
+        return value.strip().upper()
+
 
 class PromotionCheck(BaseModel):
     amount: float

@@ -69,6 +69,7 @@ class ErrorMessages(StrEnum):
 class PaymentIntentEvents(StrEnum):
     SUCCEEDED = "payment_intent.succeeded"
     FAILED = "payment_intent.failed"
+    CANCELED = "payment_intent.canceled"
 
 
 class PaymentStatusEnum(StrEnum):
