@@ -8,6 +8,7 @@ from app.config.constants import UserWalletTransactionSource, ErrorMessages
 from app.config.db import PromotionRuleAction, Beneficiary, PromotionRuleEvent, ConfigKeysEnum, PromotionStatusEnum
 from app.config.helper import get_config
 from app.config.i18n import I18n
+from app.config.email_utils import mailbox_key
 from app.config.utils import truncate_two_decimals_decimal
 from app.exceptions import CustomException
 from app.models.promotion import PromotionModel, PromotionUsageModel
@@ -389,6 +390,13 @@ class PromotionService:
             raise CustomException(code=400, name=ErrorMessages.OWN_REFERRAL_CODE_CANNOT_BE_USED,
                                   details="Own Referral Code Can not be used")
 
+        # An alias of the referrer's own mailbox (name+1@, n.a.m.e@gmail) is a fresh
+        # account with no previous eSIM, so the checks above pass. Compare mailboxes.
+        buyer_email = user_model.email or (user_model.metadata or {}).get("email")
+        if referred_user and mailbox_key(buyer_email) and mailbox_key(buyer_email) == mailbox_key(referred_user.email):
+            raise CustomException(code=400, name=ErrorMessages.OWN_REFERRAL_CODE_CANNOT_BE_USED,
+                                  details="Own Referral Code Can not be used")
+
         if referred_user:
             previously_used = self.__promotion_usage_repo.list(
                 where={"device_id": device_id, "status": PromotionStatusEnum.COMPLETED.value})
@@ -430,7 +438,7 @@ class PromotionService:
                                   details="promotion rule not found")
 
         promotion_referral_usage = self.__promotion_usage_repo.list(where={"referral_code": promotion_code})
-        if len(promotion_referral_usage) > rule.max_usage:
+        if len(promotion_referral_usage) >= rule.max_usage:
             raise CustomException(code=400, name=ErrorMessages.PROMOTION_MAX_USAGE_VALIDATION,
                                   details="times used is full")
 

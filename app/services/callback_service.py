@@ -385,6 +385,10 @@ class CallbackService:
         order_id = metadata.get("order_id")
         order = self.__user_order_repo.get_by_id(order_id)
         user_wallet = self.__user_wallet_service.get_user_wallet_by_id(user_wallet_id)
+        # Stripe retries and can redeliver webhooks; crediting again would double the top-up.
+        if event_type == "payment_intent.succeeded" and order and order.payment_status == OrderStatusEnum.SUCCESS:
+            logger.info(f"Wallet top-up order {order_id} already credited; ignoring duplicate webhook")
+            return ResponseHelper.success_response()
         try:
             if event_type == "payment_intent.succeeded":
                 amount = float(order.amount)
