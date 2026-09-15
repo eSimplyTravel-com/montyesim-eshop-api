@@ -27,8 +27,10 @@ class RelatedSearchRequestDto(BaseModel):
 class AssignRequest(BaseModel):
     bundle_code: str
     related_search: Optional[RelatedSearchRequestDto]
-    promo_code: Optional[str]
-    affiliate_code: Optional[str]
+    # Explicit None defaults: in Pydantic v2 Optional[X] without a default is
+    # still required, so a client omitting either field got a 422.
+    promo_code: Optional[str] = None
+    affiliate_code: Optional[str] = None
     payment_type: Optional[PaymentTypeEnum] = PaymentTypeEnum.CARD
 
     @field_validator("promo_code")
