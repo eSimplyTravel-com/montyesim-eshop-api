@@ -9,7 +9,8 @@ from app.config.constants import ErrorMessages
 from app.config.db import UserOrderType
 from app.config.notification_types import send_wallet_top_up_succeeded_notification
 from app.config.push_notification_manager import fcm_service
-from app.config.utils import create_wallet_top_up_intent, create_payment_ephemeral, truncate_two_decimals_decimal
+from app.config.utils import create_wallet_top_up_intent, create_payment_ephemeral, truncate_two_decimals_decimal, \
+    vat_in_price_cents
 from app.exceptions import CustomException
 from app.models.user import UserWalletModel, UserModel, UserWalletTransactionModel, UsersCopyModel
 from app.repo import UserWalletRepo, UserOrderRepo, UserWalletTransactionRepo, UserRepo
@@ -137,7 +138,10 @@ class UserWalletService:
                                                       "order_id": order.id,
                                                       "env": os.environ.get("ENVIRONMENT", "DEV"),
                                                   }, ip_address=request.client.host)
-        tax_excl = round(float(getattr(tax, "tax_amount_exclusive", 0) / 100), 2)
+        # Top-ups are taxed "inclusive", so the VAT sits in tax_amount_inclusive and
+        # the charged total equals the requested amount; the subtotal is net of VAT.
+        vat = round(vat_in_price_cents(tax) / 100, 2)
+        total = intent.amount / 100
 
         order.payment_intent_code = intent.id
         self.__user_order_repo.update_by({"id": order.id}, data=order.model_dump(exclude={"id"}))
@@ -151,10 +155,10 @@ class UserWalletService:
                                          merchant_display_name=os.getenv("MERCHANT_DISPLAY_NAME"),
                                          billing_country_code="GB",
                                          order_id=order.id,
-                                         total_price_display=f"{top_up_request.amount:.2f} {x_currency}",
-                                         subtotal_price_display=f"{intent.amount / 100:.2f} {x_currency}",
-                                         tax_price_display=f"{tax_excl} {x_currency}",
-                                         has_tax=tax_excl > 0
+                                         total_price_display=f"{total:.2f} {x_currency}",
+                                         subtotal_price_display=f"{total - vat:.2f} {x_currency}",
+                                         tax_price_display=f"{vat:.2f} {x_currency}",
+                                         has_tax=vat > 0
                                          )
         return ResponseHelper.success_data_response(response, 0)
 

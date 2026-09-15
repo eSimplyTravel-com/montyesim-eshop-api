@@ -14,7 +14,7 @@ from app.config.config import esim_hub_service_instance, generate_otp, dcb_servi
 from app.config.constants import ErrorMessages, PaymentStatusEnum, UserWalletTransactionSource
 from app.config.db import DatabaseTables, PaymentTypeEnum, ConfigKeysEnum
 from app.config.helper import get_config
-from app.config.utils import create_payment_intent, create_payment_ephemeral, stripe_get_payment_details, \
+from app.config.utils import create_payment_intent, create_payment_ephemeral, stripe_get_payment_details, vat_in_price_cents, \
     truncate_two_decimals_decimal
 from app.exceptions import BadRequestException, CustomException
 from app.models.user import UserModel, UserOrderType, OrderStatusEnum, UserOrderModel, UsersCopyModel, UserWalletModel, \
@@ -686,6 +686,12 @@ class UserBundleService:
         order.payment_intent_code = payment_intent.id
         self.__user_order_repo.update_by({"id": order.id}, data=order.model_dump(exclude={"id"}))
         tax_excl = float(getattr(tax, "tax_amount_exclusive", 0) / 100)
+        # VAT shown to the buyer is all VAT in the total, whether added on top or
+        # included. tax_amount on the order stays exclusive-only below: order history
+        # and receipts add it to modified_amount, so included VAT would count twice.
+        vat = vat_in_price_cents(tax) / 100
+        total = payment_intent.amount / 100
+        subtotal_display = f"{round(total - vat, 2):.2f} {x_currency}" if vat else f"{round(original_amount, 2)} {x_currency}"
         ephemeral = create_payment_ephemeral(payment_intent.customer)
         response = PaymentIntentResponse(publishable_key=os.getenv("STRIPE_PUBLIC_KEY"),
                                          merchant_identifier=os.getenv("MERCHANT_ID"),
@@ -696,10 +702,10 @@ class UserBundleService:
                                          merchant_display_name=os.getenv("MERCHANT_DISPLAY_NAME"),
                                          billing_country_code="GB",
                                          order_id=order.id,
-                                         subtotal_price_display=f"{round(original_amount, 2)} {x_currency}",
-                                         total_price_display=f"{round(payment_intent.amount / 100, 2)} {x_currency}",
-                                         tax_price_display=f"{round(tax_excl, 2)} {x_currency}",
-                                         has_tax=tax_excl > 0
+                                         subtotal_price_display=subtotal_display,
+                                         total_price_display=f"{round(total, 2)} {x_currency}",
+                                         tax_price_display=f"{round(vat, 2):.2f} {x_currency}",
+                                         has_tax=vat > 0
                                          )
 
         usd_tax = self.__currency_service.convert(x_currency, order.currency, tax_excl)

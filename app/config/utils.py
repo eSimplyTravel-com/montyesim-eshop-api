@@ -18,6 +18,18 @@ from app.schemas.bundle import PaymentDetailsDTO
 stripe.api_key = STRIPE_SECRET_KEY
 
 
+def vat_in_price_cents(tax: stripe.tax.Calculation | None) -> int:
+    """VAT contained in the charged total, in the smallest currency unit.
+
+    Stripe reports VAT added on top (tax_behavior "exclusive") and VAT backed out
+    of the price ("inclusive") in separate fields, and only one is non-zero per
+    calculation. Reading tax_amount_exclusive alone shows zero VAT under inclusive.
+    """
+    if tax is None:
+        return 0
+    return int(getattr(tax, "tax_amount_exclusive", 0) or 0) + int(getattr(tax, "tax_amount_inclusive", 0) or 0)
+
+
 def create_payment_intent(user_bundle_order: UserOrderModel, user_email: str,
                           metadata: dict, rate: float, currency: str = os.getenv("DEFAULT_CURRENCY"),
                           ip_address: str = None) -> tuple[
