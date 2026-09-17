@@ -199,6 +199,13 @@ def truncate_two_decimals_decimal(value: float) -> Decimal:
     return d.quantize(Decimal('0.00'), rounding=ROUND_DOWN)
 
 
+def usd_cents_to_amount(cents, rate) -> Decimal:
+    """USD minor units -> amount in the target currency, rounded like the card charge
+    in user_service.__handle_card_payment (ROUND_HALF_UP to whole cents)."""
+    return (Decimal(str(cents)) * Decimal(str(rate)) / Decimal('100')).quantize(Decimal('0.01'),
+                                                                                rounding=ROUND_HALF_UP)
+
+
 def truncate_two_decimals_decimal_rounded(value: float) -> float:
     d = Decimal(str(value))
     return float(d.quantize(Decimal('0.00'), rounding=ROUND_UP))
