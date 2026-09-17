@@ -13,7 +13,7 @@ from soupsieve.util import lower
 from app.config.config import esim_hub_service_instance, generate_otp, dcb_service_instance, supabase_client
 from app.config.constants import ErrorMessages, PaymentStatusEnum, UserWalletTransactionSource
 from app.config.db import DatabaseTables, PaymentTypeEnum, ConfigKeysEnum
-from app.config.helper import get_config
+from app.config.helper import get_config, wallet_payments_enabled
 from app.config.utils import create_payment_intent, create_payment_ephemeral, stripe_get_payment_details, \
     truncate_two_decimals_decimal
 from app.exceptions import BadRequestException, CustomException
@@ -53,6 +53,8 @@ class UserBundleService:
 
     async def assign(self, user: UserModel, device_id: str, assign_request: AssignRequest, x_currency: str,
                      locale: str, request: Request) -> Response[PaymentIntentResponse] | Response[bool]:
+        # Before any order or promotion usage is written, so a refused request leaves nothing pending
+        self.__ensure_wallet_allowed(assign_request.payment_type)
 
         bundle = await self.__esim_hub_service.get_bundle_by_id(bundle_id=assign_request.bundle_code)
         if not bundle or not bundle.is_active:
@@ -142,6 +144,7 @@ class UserBundleService:
 
     async def assign_top_up(self, user: UserModel, assign_top_up_request: AssignTopUpRequest, device_id: str,
                             request: Request, x_currency: str, locale: str) -> Response:
+        self.__ensure_wallet_allowed(assign_top_up_request.payment_type)
         bundle_response = self.__bundle_service.get_bundle(bundle_id=assign_top_up_request.bundle_code,
                                                            currency_name=x_currency, locale=locale)
         bundle = bundle_response.data
@@ -587,11 +590,18 @@ class UserBundleService:
                                           locale=language)
         return ResponseHelper.success_response()
 
+    @staticmethod
+    def __ensure_wallet_allowed(payment_type: str):
+        if payment_type == PaymentTypeEnum.WALLET and not wallet_payments_enabled():
+            raise CustomException(code=400, name=ErrorMessages.INVALID_PAYMENT_TYPE,
+                                  details="Wallet payments are disabled")
+
     async def __handle_wallet_payment(self, user: UserModel, bundle: BundleDTO, user_order: UserOrderModel,
                                       rule_id: str,
                                       modified_amount: float,
                                       iccid: str = None) -> Response[
         PaymentIntentResponse]:
+        self.__ensure_wallet_allowed(PaymentTypeEnum.WALLET)
         wallet: UserWalletModel = self.__user_wallet_service.get_user_wallet(user_id=user.id)
         rate = self.__currency_service.get_currency_rate(from_currency="USD", to_currency=wallet.currency)
         bundle_price = float(truncate_two_decimals_decimal(modified_amount * rate))

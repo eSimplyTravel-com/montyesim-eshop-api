@@ -14,3 +14,16 @@ def get_config(key: ConfigKeysEnum | str, default_value: str | int | float | Non
             config_repo.create({"key": key, "value": os_val})
         return os_val
     return val.value
+
+def wallet_payments_enabled() -> bool:
+    """True only if ALLOWED_PAYMENT_TYPES in app_config explicitly lists Wallet.
+
+    Read-only on purpose: get_config() writes a row back when the key is missing, and the live
+    row is stored lowercase ("allowed_payment_types"), so an exact-match lookup on the uppercase
+    name would insert a duplicate that the app could pick up. A missing row means disabled.
+    """
+    from app.repo.config_repo import ConfigRepo
+    for config in ConfigRepo().list(where={}):
+        if (config.key or "").upper() == "ALLOWED_PAYMENT_TYPES":
+            return "WALLET" in [item.strip().upper() for item in (config.value or "").split(",")]
+    return False

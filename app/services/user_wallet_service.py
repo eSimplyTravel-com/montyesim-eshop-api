@@ -6,6 +6,7 @@ from fastapi import Request
 from loguru import logger
 
 from app.config.constants import ErrorMessages
+from app.config.helper import wallet_payments_enabled
 from app.config.db import UserOrderType
 from app.config.notification_types import send_wallet_top_up_succeeded_notification
 from app.config.push_notification_manager import fcm_service
@@ -103,6 +104,9 @@ class UserWalletService:
     def top_up_wallet(self, top_up_request: TopUpWalletRequest, user: UserModel, request: Request,
                       x_currency: str) -> Response[
         PaymentIntentResponse]:
+        if not wallet_payments_enabled():
+            raise CustomException(code=400, name=ErrorMessages.INVALID_PAYMENT_TYPE,
+                                  details="Wallet top-ups are disabled")
         amount = top_up_request.amount
 
         user_wallet = self.__user_wallet_repo.get_first_by(where={"user_id": user.id})
