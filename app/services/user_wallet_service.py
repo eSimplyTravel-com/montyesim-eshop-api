@@ -129,7 +129,8 @@ class UserWalletService:
             "anonymous_user_id": None,
         })
 
-        intent, tax = create_wallet_top_up_intent(user_email=user.email, amount=int(amount * 100),
+        # round, not int(): int(10.12 * 100) is 1011 because of float representation
+        intent, tax = create_wallet_top_up_intent(user_email=user.email, amount=int(round(amount * 100)),
                                                   currency=x_currency,
                                                   metadata={
                                                       "user_id": user.id,

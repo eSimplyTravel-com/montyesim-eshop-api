@@ -11,14 +11,14 @@ class LoginRequest(BaseModel):
     phone: Optional[str] = None
     otp_channel: Optional[OtpChannelEnum] = None
 
+    # "+" aliases are accepted and kept as entered: not every provider treats "+"
+    # as an alias, so rewriting the address could merge distinct mailboxes. Alias
+    # abuse is checked where it matters (referrals) via app.config.email_utils.
     @field_validator("email", mode="before")
     def extract_email(cls, value):
         if value is None:
             return value
-        local_part = value.split('@')[0]
-        if "+" in local_part:
-            raise ValueError(f"Invalid email: {value}")
-        return value
+        return value.strip()
 
     @field_validator("phone", mode="before")
     def extract_phone(cls, value):

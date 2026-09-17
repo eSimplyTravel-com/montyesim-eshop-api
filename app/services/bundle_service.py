@@ -10,7 +10,7 @@ from app.config.db import UserBundleType, OrderStatusEnum, PaymentTypeEnum, Prom
 from app.config.helper import get_config
 from app.config.notification_types import send_buy_bundle_notification, send_buy_topup_notification
 from app.config.push_notification_manager import fcm_service
-from app.config.utils import truncate_two_decimals_decimal
+from app.config.utils import usd_cents_to_amount
 from app.exceptions import BadRequestException
 from app.models.app import BundleModel
 from app.models.user import UserOrderModel, UsersCopyModel, UserProfileModel, UserProfileBundleModel
@@ -319,8 +319,8 @@ class BundleService:
             coverage = self.__get_coverage(user_profile=user_profile, bundle=bundle)
             display_email = user.metadata.get("display_email", None)
             email = user.metadata.get("email", user.email) if display_email is None else display_email
-            amount = user_order.modified_amount + user_order.tax_amount
-            amount = truncate_two_decimals_decimal((amount / 100) * rate)
+            # Same rounding as the charge; truncating showed e.g. 1.30 EUR on a 1.31 EUR payment.
+            amount = usd_cents_to_amount(user_order.modified_amount + user_order.tax_amount, rate)
             data = {
                 "bundle_name": bundle.bundle_name,
                 "gprs_limit_display": bundle.gprs_limit_display,
