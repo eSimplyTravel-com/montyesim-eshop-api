@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import List
 
 from app.config.db import DatabaseTables
@@ -33,7 +34,9 @@ class StripeEventRepo(BaseRepository):
 
     def mark_processed(self, event_id: str) -> None:
         self.update_by(where={"id": event_id},
-                       data={"status": STATUS_PROCESSED, "processed_at": "now()", "last_error": None})
+                       data={"status": STATUS_PROCESSED,
+                             "processed_at": datetime.now(tz=timezone.utc).isoformat(),
+                             "last_error": None})
 
     def mark_failed(self, event_id: str, attempts: int, error: str) -> None:
         self.update_by(where={"id": event_id},

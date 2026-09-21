@@ -126,3 +126,12 @@ def test_first_delivery_is_recorded_then_queued(service):
         asyncio.run(service.handle_payment_webhook(_webhook_request()))
     service._CallbackService__stripe_event_repo.record.assert_called_once()
     service._CallbackService__task_executor.add_task.assert_called_once()
+
+
+def test_mark_processed_sends_a_real_timestamp(repo):
+    # "now()" would be sent as a literal string and rejected by Postgres.
+    with patch.object(StripeEventRepo, "update_by") as update:
+        repo.mark_processed("evt_1")
+    stamp = update.call_args.kwargs["data"]["processed_at"]
+    from datetime import datetime
+    assert datetime.fromisoformat(stamp).tzinfo is not None
