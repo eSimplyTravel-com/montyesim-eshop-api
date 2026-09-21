@@ -252,7 +252,7 @@ class BundleService:
         user_order.order_status = OrderStatusEnum.SUCCESS
         if esim_hub_order is None:
             user_order.order_status = OrderStatusEnum.FAILURE
-            self.__user_order_repo.update_by({"id": user_order.id}, data=user_order.model_dump(exclude={"id"}))
+            self.__user_order_repo.update_by({"id": user_order.id}, data=user_order.model_dump(exclude={"id", "fulfilment_claimed_at"}))
             logger.info(f"error creating esim hub profile for order {user_order.id}")
             await self.__promotion_service.update_promotion_usage(user_id=user_id, code=promo_code, status="failed",
                                                                   rule_id=rule_id, order_id=order_id)
@@ -263,7 +263,9 @@ class BundleService:
             # see that Monty already delivered and will not order a second eSIM.
             self.__user_order_repo.update_by({"id": user_order.id},
                                              data={"esim_order_id": esim_hub_order.orderId})
-        self.__user_order_repo.update_by({"id": user_order.id}, data=user_order.model_dump(exclude={"id"}))
+        # fulfilment_claimed_at is excluded: this stale copy must not release the lock.
+        self.__user_order_repo.update_by({"id": user_order.id},
+                                         data=user_order.model_dump(exclude={"id", "fulfilment_claimed_at"}))
         user_profile = self.__user_profile_repo.create({
             "user_id": user_id,
             "user_order_id": user_order.id,

@@ -145,7 +145,7 @@ class UserWalletService:
         tax_excl = round(float(getattr(tax, "tax_amount_exclusive", 0) / 100), 2)
 
         order.payment_intent_code = intent.id
-        self.__user_order_repo.update_by({"id": order.id}, data=order.model_dump(exclude={"id"}))
+        self.__user_order_repo.update_by({"id": order.id}, data=order.model_dump(exclude={"id", "fulfilment_claimed_at"}))
         ephemeral = create_payment_ephemeral(intent.customer)
         response = PaymentIntentResponse(publishable_key=os.getenv("STRIPE_PUBLIC_KEY"),
                                          merchant_identifier=os.getenv("MERCHANT_ID"),

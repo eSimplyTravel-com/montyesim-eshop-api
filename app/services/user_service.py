@@ -694,7 +694,7 @@ class UserBundleService:
                                                     currency=x_currency,
                                                     ip_address=request.client.host)
         order.payment_intent_code = payment_intent.id
-        self.__user_order_repo.update_by({"id": order.id}, data=order.model_dump(exclude={"id"}))
+        self.__user_order_repo.update_by({"id": order.id}, data=order.model_dump(exclude={"id", "fulfilment_claimed_at"}))
         tax_excl = float(getattr(tax, "tax_amount_exclusive", 0) / 100)
         ephemeral = create_payment_ephemeral(payment_intent.customer)
         response = PaymentIntentResponse(publishable_key=os.getenv("STRIPE_PUBLIC_KEY"),
