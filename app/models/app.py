@@ -12,6 +12,16 @@ class AppConfigModel(BaseModel):
     value: str = Field(None, title="value")
 
 
+class StripeEventModel(BaseModel):
+    id: str
+    type: Optional[str] = None
+    status: Optional[str] = None
+    attempts: Optional[int] = 0
+    last_error: Optional[str] = None
+    created_at: Optional[str] = None
+    processed_at: Optional[str] = None
+
+
 class ContactUsModel(BaseModel):
     id: Optional[int] = None
     email: str

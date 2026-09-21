@@ -21,6 +21,7 @@ from app.config.utils import parse_iso_datetime, truncate_two_decimals_decimal_r
 from app.models.user import OrderStatusEnum, UserOrderType, UsersCopyModel, UserOrderModel, UserProfileBundleModel, \
     UserProfileModel
 from app.repo import UserOrderRepo, UserProfileRepo, UserRepo, UserProfileBundleRepo
+from app.repo.stripe_event_repo import StripeEventRepo
 from app.schemas.callback import ConsumptionLimitRequest
 from app.schemas.dto_mapper import DtoMapper
 from app.schemas.home import BundleDTO
@@ -52,6 +53,7 @@ class CallbackService:
         self.__promotion_service = PromotionService()
         self.__bundle_service = BundleService()
         self.__task_executor = TaskExecutor()
+        self.__stripe_event_repo = StripeEventRepo()
 
     def _execute_sync_request(self, sync_request: SyncRequest):
         """Execute a single sync request"""
@@ -131,12 +133,56 @@ class CallbackService:
             logger.error("Stripe webhook signature verification failed.")
             raise HTTPException(status_code=400, detail="Invalid signature")
 
+        event_id = event.get("id")
+        if not self.__stripe_event_repo.record(event_id=event_id, event_type=event.get("type")):
+            # Stripe redelivers the same event after a timeout; the first delivery owns it.
+            logger.info(f"stripe event {event_id} already recorded, skipping duplicate delivery")
+            return ResponseHelper.success_response()
+
         def task():
-            return self.__handle_payment_webhook_data(event=event)
+            return self.process_stripe_event(event_id=event_id, event=event)
 
         self.__task_executor.add_task(task)
 
         return ResponseHelper.success_response()
+
+    def process_stripe_event(self, event_id: str, event, claim_failed: bool = False):
+        """Run one recorded event exactly once, and leave a trace when it does not finish."""
+        claimed = self.__stripe_event_repo.claim_failed(event_id) if claim_failed \
+            else self.__stripe_event_repo.claim(event_id)
+        if not claimed:
+            logger.info(f"stripe event {event_id} is already being handled elsewhere")
+            return None
+        attempts = self.__stripe_event_repo.get_attempts(event_id) + 1
+        try:
+            result = self.__handle_payment_webhook_data(event=event)
+            self.__stripe_event_repo.mark_processed(event_id)
+            return result
+        except Exception as e:
+            # Deliberately loud: an unprocessed payment means a paid order without an eSIM.
+            logger.error(f"STRIPE_EVENT_FAILED id={event_id} attempt={attempts} error={e}")
+            self.__stripe_event_repo.mark_failed(event_id=event_id, attempts=attempts, error=str(e))
+            return None
+
+    def retry_stripe_events(self, max_attempts: int = 5, limit: int = 20):
+        """Pick up events a restart or an error left unfinished. Called by the scheduler."""
+        stuck = self.__stripe_event_repo.list_retryable(max_attempts=max_attempts, limit=limit)
+        if not stuck:
+            return 0
+        logger.info(f"retrying {len(stuck)} unfinished stripe events")
+        retried = 0
+        for record in stuck:
+            try:
+                event = stripe.Event.retrieve(record.id)
+            except Exception as e:
+                logger.error(f"STRIPE_EVENT_FAILED id={record.id} could not be fetched from Stripe: {e}")
+                continue
+            # A crashed run leaves the row in processing/failed, so claim both shapes.
+            self.__stripe_event_repo.update_by(where={"id": record.id, "status": "processing"},
+                                               data={"status": "failed"})
+            self.process_stripe_event(event_id=record.id, event=event, claim_failed=True)
+            retried += 1
+        return retried
 
     async def handle_payment_webhook_fake(self, request: Request):
         try:
