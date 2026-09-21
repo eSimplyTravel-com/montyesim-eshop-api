@@ -241,3 +241,22 @@ def test_adapter_raises_unknown_when_the_order_cannot_be_read_back():
     with pytest.raises(EsimHubUnknownOutcomeError):
         asyncio.run(service.create_reseller_order(bundle_code="b", order_id="o",
                                                   user=MagicMock(metadata={}, email="a@b.c")))
+
+
+def test_the_lock_never_expires_on_its_own(bundle_service):
+    # A timer that hands a mid-fulfilment order to a second worker is how one payment becomes
+    # two eSIMs. The lock asks for no lease at all.
+    from app.repo.user_order_repo import OrderFulfilmentLock
+    repo = MagicMock()
+    OrderFulfilmentLock(repo).acquire("ord_1")
+    name, params = repo.client.rpc.call_args[0]
+    assert name == "claim_order_fulfilment"
+    assert params == {"p_order_id": "ord_1"}, "no lease parameter may be sent"
+
+
+def test_the_sql_lock_has_no_expiry_clause():
+    sql = open("ops/sql/2026-09-21-stripe-event.sql").read()
+    claim = sql[sql.index("function public.claim_order_fulfilment"):]
+    body = claim[:claim.index("$$;")]
+    assert "make_interval" not in body, "the order lock must not release itself on a timer"
+    assert "esim_order_id is null" in body

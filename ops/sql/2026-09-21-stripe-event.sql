@@ -73,7 +73,7 @@ $$;
 -- exactly one worker may ever be inside that call for a given order.
 alter table public.user_order add column if not exists fulfilment_claimed_at timestamptz;
 
-create or replace function public.claim_order_fulfilment(p_order_id text, p_lease_seconds integer)
+create or replace function public.claim_order_fulfilment(p_order_id text, p_lease_seconds integer default null)
 returns boolean
 language plpgsql
 as $$
@@ -85,12 +85,19 @@ begin
            fulfilment_claimed_at = now()
      where id::text = p_order_id
        and esim_order_id is null              -- already ordered at the hub: never claim again
-       and (
-            order_status in ('pending', 'failure')
-            or (order_status = 'fulfilling'
-                and fulfilment_claimed_at < now() - make_interval(secs => p_lease_seconds))
-       );
+       -- NO lease expiry on purpose. If a worker disappears mid-call the order stays
+       -- 'fulfilling' and a human reconciles it in the Monty portal: letting a timer hand the
+       -- order to a second worker is exactly how you buy two eSIMs for one payment.
+       and order_status in ('pending', 'failure');
     get diagnostics updated = row_count;
     return updated > 0;
 end;
 $$;
+
+-- Releasing a stuck order is a deliberate human act, after checking the Monty portal:
+--   select id, order_status, esim_order_id, fulfilment_claimed_at from public.user_order
+--    where order_status = 'fulfilling' and fulfilment_claimed_at < now() - interval '15 minutes';
+-- If Monty has NO order for it:
+--   update public.user_order set order_status = 'failure', fulfilment_claimed_at = null where id = '<id>';
+-- If Monty DOES have one, record it instead and let the repair path finish the local records:
+--   update public.user_order set esim_order_id = '<hub order id>' where id = '<id>';

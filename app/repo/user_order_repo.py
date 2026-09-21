@@ -9,9 +9,12 @@ class UserOrderRepo(BaseRepository):
 
 
 class OrderFulfilmentLock:
-    """Exactly-one-worker lock around the non-idempotent eSIM Hub call."""
+    """Exactly-one-worker lock around the non-idempotent eSIM Hub call.
 
-    LEASE_SECONDS = 15 * 60
+    The lock never expires by itself. An order left mid-fulfilment stays locked until a human
+    checks the Monty portal and releases it, because a timer that hands the order to a second
+    worker is how one payment becomes two eSIMs.
+    """
 
     def __init__(self, repo: "UserOrderRepo"):
         self.__repo = repo
@@ -19,7 +22,6 @@ class OrderFulfilmentLock:
     def acquire(self, order_id: str) -> bool:
         return bool(self.__repo.client.rpc("claim_order_fulfilment", {
             "p_order_id": str(order_id),
-            "p_lease_seconds": self.LEASE_SECONDS,
         }).execute().data)
 
 
