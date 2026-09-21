@@ -27,3 +27,9 @@ def wallet_payments_enabled() -> bool:
         if (config.key or "").upper() == "ALLOWED_PAYMENT_TYPES":
             return "WALLET" in [item.strip().upper() for item in (config.value or "").split(",")]
     return False
+
+
+def fake_payment_webhook_enabled() -> bool:
+    """The fake-payment endpoint runs the full payment handler on an unsigned, unauthenticated
+    body. It stays off unless someone deliberately switches it on for a test environment."""
+    return os.getenv("ENABLE_FAKE_PAYMENT_WEBHOOK", "false").strip().lower() in ("true", "1", "yes")
