@@ -1,5 +1,7 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.params import Query
+
+from app.config.helper import fake_payment_webhook_enabled
 
 from app.schemas.response import ResponseHelper
 from app.services.callback_service import CallbackService
@@ -15,7 +17,12 @@ async def payment_webhook(request: Request):
 
 
 @router.post("/payment-webhook-fake")
-async def payment_webhook(request: Request):
+async def payment_webhook_fake(request: Request):
+    # This runs the full payment handler on a body the caller writes, with no Stripe signature and
+    # no authentication: anyone holding an order id (the browser is given one at checkout) could
+    # fulfil an unpaid order. Off unless ENABLE_FAKE_PAYMENT_WEBHOOK is explicitly set.
+    if not fake_payment_webhook_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
     await service.handle_payment_webhook_fake(request)
 
 
