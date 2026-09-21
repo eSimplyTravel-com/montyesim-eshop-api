@@ -66,32 +66,22 @@ class StripeEventRepo(BaseRepository):
             return False
 
     def claim(self, event_id: str, max_attempts: int) -> Optional[str]:
-        """Take ownership of one event. Returns a token, or None if someone else holds it.
+        """Take ownership of one event. Returns a token, or None if it is not claimable.
 
-        Claimable: pending, failed, or a processing row whose lease has expired.
+        The work is done by the claim_stripe_event() SQL function: one statement, the database
+        clock, and the attempt increment together, so two workers cannot consume one attempt.
         """
-        current = self.get_by_id(event_id)
-        if not current:
-            return None
         token = str(uuid.uuid4())
-        data = {
-            "status": STATUS_PROCESSING,
-            "claimed_at": _now().isoformat(),
-            "claimed_by": token,
-            "attempts": int(current.attempts or 0) + 1,
-        }
-        now = _now().isoformat()
-        for status in RETRYABLE_STATUSES:
-            # The filters enforce eligibility at acquisition, not just at selection: a row that
-            # another worker already pushed over the cap or into a backoff window cannot be taken.
-            rows = self.table.update(data).eq("id", event_id).eq("status", status) \
-                .lt("attempts", max_attempts).lte("next_attempt_at", now).execute().data
-            if rows:
-                return token
-        expired_before = (_now() - timedelta(seconds=LEASE_SECONDS)).isoformat()
-        rows = self.table.update(data).eq("id", event_id).eq("status", STATUS_PROCESSING) \
-            .lt("attempts", max_attempts).lt("claimed_at", expired_before).execute().data
-        return token if rows else None
+        try:
+            claimed = self.client.rpc("claim_stripe_event", {
+                "p_event_id": event_id,
+                "p_max_attempts": max_attempts,
+                "p_token": token,
+                "p_lease_seconds": LEASE_SECONDS,
+            }).execute().data
+        except Exception as e:
+            raise DatabaseException(str(e))
+        return token if claimed else None
 
     def mark_processed(self, event_id: str, token: str) -> None:
         # claimed_by guards against a superseded worker overwriting a newer result.
@@ -121,9 +111,13 @@ class StripeEventRepo(BaseRepository):
             .order("claimed_at").limit(limit).execute().data or []
         return [StripeEventModel(**row) for row in rows]
 
-    def mark_dead(self, event_id: str, error: str) -> None:
-        self.table.update({"status": STATUS_DEAD, "last_error": str(error)[:1000]}) \
-            .eq("id", event_id).execute()
+    def mark_dead(self, event_id: str, token: str, error: str) -> bool:
+        """Only park the exact row we selected: if its worker finished or someone re-claimed it,
+        the filters match nothing and we leave it alone."""
+        rows = self.table.update({"status": STATUS_DEAD, "last_error": str(error)[:1000]}) \
+            .eq("id", event_id).eq("status", STATUS_PROCESSING).eq("claimed_by", token) \
+            .execute().data
+        return bool(rows)
 
     def list_retryable(self, max_attempts: int, limit: int = 20) -> List[StripeEventModel]:
         """Events that are due for another run. Filtering happens in the database, so a batch of

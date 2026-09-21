@@ -161,11 +161,15 @@ class CallbackService:
             logger.info(f"stripe event {event_id} is held by another worker")
             return None
         try:
-            if self.__already_fulfilled(event):
-                logger.info(f"stripe event {event_id} targets an order that is already successful; "
-                            f"recording it without running fulfilment again")
+            state = self.__fulfilment_state(event)
+            if state == "done":
+                logger.info(f"stripe event {event_id} targets an order that Monty already fulfilled; "
+                            f"recording it without ordering again")
                 self.__stripe_event_repo.mark_processed(event_id=event_id, token=token)
                 return None
+            if state == "unknown":
+                # Fail closed: running fulfilment blind could order a second eSIM.
+                raise RuntimeError("could not establish fulfilment state; retrying later")
             result = self.__handle_payment_webhook_data(event=event)
             if isinstance(result, Exception) and not self.__is_handled_result(result):
                 # buy_bundle/top_up_bundle return the exception instead of raising it.
@@ -180,21 +184,26 @@ class CallbackService:
             level(f"STRIPE_EVENT_FAILED id={event_id} status={status} error={e}")
             return None
 
-    def __already_fulfilled(self, event) -> bool:
-        """Guards the replay path: ordering at Monty is not idempotent, so an order that is already
-        marked successful must never be fulfilled a second time."""
+    def __fulfilment_state(self, event) -> str:
+        """"done" only when the eSIM was actually ordered at Monty. payment_status is NOT that
+        marker: it is set to success even when the hub call fails (bundle_service.py:205-214).
+        Returns "unknown" when we cannot tell, and the caller then refuses to run fulfilment."""
+        if event.get("type") != "payment_intent.succeeded":
+            return "open"
         try:
-            if event.get("type") != "payment_intent.succeeded":
-                return False
             metadata = (event.get("data", {}).get("object", {}) or {}).get("metadata") or {}
             order_id = metadata.get("order_id")
             if not order_id:
-                return False
+                return "open"
             order = self.__user_order_repo.get_by_id(order_id)
-            return bool(order and order.payment_status == OrderStatusEnum.SUCCESS)
+            if not order:
+                return "open"
+            if order.order_status == OrderStatusEnum.SUCCESS and order.esim_order_id:
+                return "done"
+            return "open"
         except Exception as e:
-            logger.error(f"could not check fulfilment state for event {event.get('id')}: {e}")
-            return False
+            logger.error(f"could not read fulfilment state for event {event.get('id')}: {e}")
+            return "unknown"
 
     @staticmethod
     def __is_handled_result(result) -> bool:
@@ -215,13 +224,21 @@ class CallbackService:
         max_attempts = self.__max_event_attempts()
         stuck = self.__stripe_event_repo.list_retryable(max_attempts=max_attempts, limit=limit)
         for abandoned in self.__stripe_event_repo.list_abandoned(max_attempts=max_attempts, limit=limit):
-            logger.critical(f"STRIPE_EVENT_FAILED id={abandoned.id} status=dead "
-                            f"error=worker disappeared on the final attempt")
-            self.__stripe_event_repo.mark_dead(abandoned.id, "worker disappeared on the final attempt")
+            if self.__stripe_event_repo.mark_dead(abandoned.id, token=abandoned.claimed_by,
+                                                  error="worker disappeared on the final attempt"):
+                logger.critical(f"STRIPE_EVENT_FAILED id={abandoned.id} status=dead "
+                                f"error=worker disappeared on the final attempt")
         retried = 0
         for record in stuck:
             event = self.__rebuild_event(record.id)
             if event is None:
+                # Count it, so an event we can never rebuild ends as dead instead of blocking
+                # the oldest slots of every future batch.
+                token = self.__stripe_event_repo.claim(record.id, max_attempts=max_attempts)
+                if token:
+                    self.__stripe_event_repo.mark_failed(
+                        event_id=record.id, token=token, error="event could not be rebuilt",
+                        max_attempts=max_attempts, backoff_seconds=self.__event_backoff())
                 continue
             self.process_stripe_event(event_id=record.id, event=event)
             retried += 1

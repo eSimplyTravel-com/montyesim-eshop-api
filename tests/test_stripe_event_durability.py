@@ -102,45 +102,33 @@ def test_webhook_stores_the_payload_for_later_replay(service):
 
 # --- claiming: ownership and leases ------------------------------------------------------------
 
-def _claim_repo(repo, rows_per_update, current_attempts=0):
-    repo.get_by_id = MagicMock(return_value=MagicMock(attempts=current_attempts))
-    queries = []
-
-    def update(data):
-        query = FakeQuery(rows_per_update.pop(0) if rows_per_update else None, [])
-        query.data_sent = data
-        queries.append(query)
-        return query
-
-    repo.table.update.side_effect = update
-    return queries
+def _claim_repo(repo, claimed):
+    repo.client = MagicMock()
+    repo.client.rpc.return_value.execute.return_value = MagicMock(data=claimed)
+    return repo.client
 
 
-def test_claim_takes_a_pending_event_and_counts_the_attempt(repo):
-    queries = _claim_repo(repo, [[{"id": "evt_1"}]], current_attempts=2)
+def test_claim_uses_the_atomic_sql_function(repo):
+    client = _claim_repo(repo, claimed=True)
     token = repo.claim("evt_1", max_attempts=5)
     assert token
-    assert queries[0].data_sent["attempts"] == 3
-    assert queries[0].data_sent["claimed_by"] == token
+    name, params = client.rpc.call_args[0]
+    assert name == "claim_stripe_event"
+    # eligibility, attempt increment and the lease are all decided inside one statement
+    assert params["p_event_id"] == "evt_1" and params["p_max_attempts"] == 5
+    assert params["p_token"] == token and params["p_lease_seconds"] == LEASE_SECONDS
 
 
-def test_claim_refuses_an_event_another_worker_is_running(repo):
-    # pending -> no rows, failed -> no rows, expired processing -> no rows
-    _claim_repo(repo, [None, None, None])
+def test_claim_returns_none_when_the_row_is_not_claimable(repo):
+    _claim_repo(repo, claimed=False)
     assert repo.claim("evt_1", max_attempts=5) is None
 
 
-def test_claim_reclaims_an_event_whose_lease_expired(repo):
-    queries = _claim_repo(repo, [None, None, [{"id": "evt_1"}]])
-    assert repo.claim("evt_1", max_attempts=5)
-    cutoff = [c[1] for c in queries[2].calls if c[0] == "lt" and c[1][0] == "claimed_at"][0]
-    age = datetime.now(tz=timezone.utc) - datetime.fromisoformat(cutoff[1])
-    assert timedelta(seconds=LEASE_SECONDS - 60) < age < timedelta(seconds=LEASE_SECONDS + 60)
-
-
-def test_claim_returns_none_for_an_unknown_event(repo):
-    repo.get_by_id = MagicMock(return_value=None)
-    assert repo.claim("evt_missing", max_attempts=5) is None
+def test_claim_surfaces_database_errors(repo):
+    repo.client = MagicMock()
+    repo.client.rpc.return_value.execute.side_effect = Exception("function missing")
+    with pytest.raises(DatabaseException):
+        repo.claim("evt_1", max_attempts=5)
 
 
 def test_result_writes_require_the_owner_token(repo):
@@ -257,13 +245,6 @@ def test_conflict_without_an_existing_row_is_not_treated_as_duplicate(repo):
         repo.record("evt_1", "payment_intent.succeeded", payload="{}")
 
 
-def test_claim_enforces_the_attempt_cap_and_backoff_at_acquisition(repo):
-    queries = _claim_repo(repo, [[{"id": "evt_1"}]])
-    repo.claim("evt_1", max_attempts=5)
-    assert ("lt", ("attempts", 5)) in queries[0].calls
-    assert any(call[0] == "lte" and call[1][0] == "next_attempt_at" for call in queries[0].calls)
-
-
 def test_abandoned_final_attempt_is_swept_into_dead(service):
     service._CallbackService__stripe_event_repo.list_abandoned.return_value = [MagicMock(id="evt_dead")]
     service._CallbackService__stripe_event_repo.list_retryable.return_value = []
@@ -280,20 +261,6 @@ def test_declined_payment_is_not_retried(service):
         service.process_stripe_event("evt_1", {"id": "evt_1", "type": "payment_intent.payment_failed"})
     service._CallbackService__stripe_event_repo.mark_processed.assert_called_once()
     service._CallbackService__stripe_event_repo.mark_failed.assert_not_called()
-
-
-def test_replay_never_fulfils_an_order_that_already_succeeded(service):
-    from app.models.user import OrderStatusEnum
-    service._CallbackService__stripe_event_repo.claim.return_value = "tok"
-    service._CallbackService__user_order_repo = MagicMock()
-    service._CallbackService__user_order_repo.get_by_id.return_value = MagicMock(
-        payment_status=OrderStatusEnum.SUCCESS)
-    event = {"id": "evt_1", "type": "payment_intent.succeeded",
-             "data": {"object": {"metadata": {"order_id": "ord_1"}}}}
-    with patch.object(CallbackService, "_CallbackService__handle_payment_webhook_data") as handler:
-        service.process_stripe_event("evt_1", event)
-        handler.assert_not_called()  # ordering at Monty is not idempotent
-    service._CallbackService__stripe_event_repo.mark_processed.assert_called_once()
 
 
 def test_first_delivery_of_a_pending_order_still_runs(service):
@@ -322,3 +289,64 @@ def test_due_rows_cannot_starve_crash_recovery(repo):
     repo.table.select.side_effect = select
     ids = [e.id for e in repo.list_retryable(max_attempts=5, limit=20)]
     assert "stale_1" in ids and len(ids) == 20
+
+
+def test_dead_sweep_cannot_overwrite_a_worker_that_finished(repo):
+    query = FakeQuery([], [])
+    repo.table.update.return_value = query
+    assert repo.mark_dead("evt_1", token="tok", error="gone") is False
+    assert ("eq", ("status", "processing")) in query.calls
+    assert ("eq", ("claimed_by", "tok")) in query.calls
+
+
+def test_guard_refuses_to_run_fulfilment_when_the_order_cannot_be_read(service):
+    service._CallbackService__stripe_event_repo.claim.return_value = "tok"
+    service._CallbackService__stripe_event_repo.mark_failed.return_value = "failed"
+    service._CallbackService__user_order_repo = MagicMock()
+    service._CallbackService__user_order_repo.get_by_id.side_effect = Exception("db down")
+    event = {"id": "evt_1", "type": "payment_intent.succeeded",
+             "data": {"object": {"metadata": {"order_id": "ord_1"}}}}
+    with patch.object(CallbackService, "_CallbackService__handle_payment_webhook_data") as handler:
+        assert service.process_stripe_event("evt_1", event) is None
+        handler.assert_not_called()  # fail closed: never order blind
+    service._CallbackService__stripe_event_repo.mark_processed.assert_not_called()
+
+
+def test_paid_order_that_monty_never_fulfilled_is_retried(service):
+    from app.models.user import OrderStatusEnum
+    service._CallbackService__stripe_event_repo.claim.return_value = "tok"
+    service._CallbackService__user_order_repo = MagicMock()
+    # payment succeeded, but the hub call failed: payment_status is success anyway
+    service._CallbackService__user_order_repo.get_by_id.return_value = MagicMock(
+        payment_status=OrderStatusEnum.SUCCESS, order_status=OrderStatusEnum.FAILURE, esim_order_id=None)
+    event = {"id": "evt_1", "type": "payment_intent.succeeded",
+             "data": {"object": {"metadata": {"order_id": "ord_1"}}}}
+    with patch.object(CallbackService, "_CallbackService__handle_payment_webhook_data",
+                      return_value="ok") as handler:
+        assert service.process_stripe_event("evt_1", event) == "ok"
+        handler.assert_called_once()
+
+
+def test_order_already_delivered_by_monty_is_not_ordered_again(service):
+    from app.models.user import OrderStatusEnum
+    service._CallbackService__stripe_event_repo.claim.return_value = "tok"
+    service._CallbackService__user_order_repo = MagicMock()
+    service._CallbackService__user_order_repo.get_by_id.return_value = MagicMock(
+        payment_status=OrderStatusEnum.SUCCESS, order_status=OrderStatusEnum.SUCCESS,
+        esim_order_id="hub_123")
+    event = {"id": "evt_1", "type": "payment_intent.succeeded",
+             "data": {"object": {"metadata": {"order_id": "ord_1"}}}}
+    with patch.object(CallbackService, "_CallbackService__handle_payment_webhook_data") as handler:
+        service.process_stripe_event("evt_1", event)
+        handler.assert_not_called()
+    service._CallbackService__stripe_event_repo.mark_processed.assert_called_once()
+
+
+def test_unrebuildable_event_consumes_an_attempt(service):
+    service._CallbackService__stripe_event_repo.list_abandoned.return_value = []
+    service._CallbackService__stripe_event_repo.list_retryable.return_value = [MagicMock(id="evt_9")]
+    service._CallbackService__stripe_event_repo.payload_of.return_value = (None, None)
+    service._CallbackService__stripe_event_repo.claim.return_value = "tok"
+    with patch("app.services.callback_service.stripe.Event.retrieve", side_effect=Exception("gone")):
+        assert service.retry_stripe_events() == 0
+    service._CallbackService__stripe_event_repo.mark_failed.assert_called_once()

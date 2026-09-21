@@ -40,3 +40,29 @@ alter table public.stripe_event enable row level security;
 -- Checks to run after the deploy:
 -- select status, count(*) from public.stripe_event group by status;                 -- expect processed
 -- select id, type, attempts, last_error from public.stripe_event where status = 'dead';  -- expect none
+
+-- Atomic claim. One statement, database clock, eligibility and attempt increment together, so two
+-- workers can never consume the same attempt or bypass a backoff window.
+create or replace function public.claim_stripe_event(
+    p_event_id text, p_max_attempts integer, p_token text, p_lease_seconds integer)
+returns boolean
+language plpgsql
+as $$
+declare
+    updated integer;
+begin
+    update public.stripe_event
+       set status = 'processing',
+           claimed_at = now(),
+           claimed_by = p_token,
+           attempts = attempts + 1
+     where id = p_event_id
+       and attempts < p_max_attempts
+       and (
+            (status in ('pending', 'failed') and coalesce(next_attempt_at, now()) <= now())
+            or (status = 'processing' and claimed_at < now() - make_interval(secs => p_lease_seconds))
+       );
+    get diagnostics updated = row_count;
+    return updated > 0;
+end;
+$$;
