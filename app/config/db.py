@@ -11,6 +11,8 @@ class OrderStatusEnum(StrEnum):
     FAILURE = "failure"
     PENDING = "pending"
     CANCELED = "canceled"
+    # Set before the eSIM Hub call so a replay can tell "never ordered" from "outcome unknown".
+    FULFILLING = "fulfilling"
 
 
 class UserOrderType(StrEnum):

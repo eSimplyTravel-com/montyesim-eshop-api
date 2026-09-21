@@ -11,7 +11,7 @@ from app.config.helper import get_config
 from app.config.notification_types import send_buy_bundle_notification, send_buy_topup_notification
 from app.config.push_notification_manager import fcm_service
 from app.config.utils import usd_cents_to_amount
-from app.exceptions import BadRequestException
+from app.exceptions import BadRequestException, FulfilmentNeedsReviewError
 from app.models.app import BundleModel
 from app.models.user import UserOrderModel, UsersCopyModel, UserProfileModel, UserProfileBundleModel
 from app.repo import UserRepo, UserOrderRepo, UserProfileRepo, UserProfileBundleRepo
@@ -194,6 +194,27 @@ class BundleService:
         discount_amount = self.__get_discount_amount(promo_code) if promo_code else None
         discount_rate = self.__get_discount_rate(promo_code) if promo_code else None
         bundle_type = self.__bundle_type(code=bundle.bundle_code)
+
+        hub_order_id = getattr(user_order, "esim_order_id", None)
+        existing_profile = self.__user_profile_repo.get_first_by({"user_order_id": user_order.id})
+        if hub_order_id and existing_profile:
+            logger.info(f"order {user_order.id} was already fulfilled as hub order "
+                        f"{hub_order_id}; nothing to do")
+            return ResponseHelper.success_response()
+        if hub_order_id and not existing_profile:
+            # The hub order exists but our records do not, and the hub has no lookup by our
+            # identifier, so we cannot rebuild them safely.
+            raise FulfilmentNeedsReviewError(
+                f"order {user_order.id} has hub order {hub_order_id} but no profile")
+        if getattr(user_order, "order_status", None) == OrderStatusEnum.FULFILLING:
+            # A previous attempt reached the hub and never came back. Ordering again could buy a
+            # second eSIM, so stop and let a human reconcile it in the Monty portal.
+            raise FulfilmentNeedsReviewError(
+                f"order {user_order.id} was mid-fulfilment ({unique_identifier}); not ordering again")
+
+        user_order.order_status = OrderStatusEnum.FULFILLING
+        self.__user_order_repo.update_by({"id": user_order.id}, data={"order_status": OrderStatusEnum.FULFILLING})
+
         esim_hub_order = await self.__esim_hub_service.create_reseller_order(bundle_code=bundle.bundle_code,
                                                                              order_id=unique_identifier, user=user,
                                                                              payment_type=payment_type,
@@ -214,6 +235,10 @@ class BundleService:
             return BadRequestException("Payment failed")
         else:
             user_order.esim_order_id = esim_hub_order.orderId
+            # Persist the hub order id first and on its own: if anything below fails, a replay can
+            # see that Monty already delivered and will not order a second eSIM.
+            self.__user_order_repo.update_by({"id": user_order.id},
+                                             data={"esim_order_id": esim_hub_order.orderId})
         self.__user_order_repo.update_by({"id": user_order.id}, data=user_order.model_dump(exclude={"id"}))
         user_profile = self.__user_profile_repo.create({
             "user_id": user_id,
@@ -250,10 +275,7 @@ class BundleService:
                                            user_id=user_order.user_id)
         user = self.__user_repo.get_by_id(record_id=user_order.user_id)
 
-        def task():
-            self.__send_email(user=user, user_profile=user_profile, bundle=bundle, user_order=user_order)
-
-        self.__task_executor.add_task(task)
+        self.__send_email(user=user, user_profile=user_profile, bundle=bundle, user_order=user_order)
         return ResponseHelper.success_response()
 
     async def top_up_bundle(self, bundle: BundleDTO, user_order: UserOrderModel, iccid: str, user_id: str,

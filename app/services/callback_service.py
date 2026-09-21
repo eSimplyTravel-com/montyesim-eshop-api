@@ -21,6 +21,7 @@ from app.config.utils import parse_iso_datetime, truncate_two_decimals_decimal_r
 from app.models.user import OrderStatusEnum, UserOrderType, UsersCopyModel, UserOrderModel, UserProfileBundleModel, \
     UserProfileModel
 from app.repo import UserOrderRepo, UserProfileRepo, UserRepo, UserProfileBundleRepo
+from app.exceptions import FulfilmentNeedsReviewError
 from app.repo.stripe_event_repo import DuplicateEventError, StripeEventRepo
 from app.schemas.callback import ConsumptionLimitRequest
 from app.schemas.dto_mapper import DtoMapper
@@ -176,6 +177,11 @@ class CallbackService:
                 raise result
             self.__stripe_event_repo.mark_processed(event_id=event_id, token=token)
             return result
+        except FulfilmentNeedsReviewError as e:
+            # Never retried: a second attempt could order a second eSIM at Monty.
+            self.__stripe_event_repo.mark_dead(event_id=event_id, token=token, error=str(e))
+            logger.critical(f"STRIPE_EVENT_NEEDS_REVIEW id={event_id} error={e}")
+            return None
         except Exception as e:
             status = self.__stripe_event_repo.mark_failed(
                 event_id=event_id, token=token, error=str(e),
@@ -198,7 +204,7 @@ class CallbackService:
             order = self.__user_order_repo.get_by_id(order_id)
             if not order:
                 return "open"
-            if order.order_status == OrderStatusEnum.SUCCESS and order.esim_order_id:
+            if order.esim_order_id and self.__user_profile_repo.get_first_by({"user_order_id": order.id}):
                 return "done"
             return "open"
         except Exception as e:
@@ -516,13 +522,11 @@ class CallbackService:
                 amount = float(order.amount)
                 logger.info(f"updating user wallet: {user_wallet} with new {amount=}")
 
-                def task():
-                    self.__user_wallet_service.add_wallet_transaction(amount=amount, user_id=user_id,
-                                                                      source=UserWalletTransactionSource.TOP_UP_WALLET,
-                                                                      order_currency="USD")
-                    return
-
-                self.__task_executor.add_task(task)
+                # Credit first, then record success: a queued credit could be lost on a restart
+                # while the order already looked settled.
+                self.__user_wallet_service.add_wallet_transaction(amount=amount, user_id=user_id,
+                                                                  source=UserWalletTransactionSource.TOP_UP_WALLET,
+                                                                  order_currency="USD")
                 self.__user_order_repo.update(order_id, {"payment_status": OrderStatusEnum.SUCCESS})
                 logger.info(
                     f"Top-Up for user {user_id} wallet {user_wallet} with amount {amount} {order.currency} succeeded")
@@ -538,7 +542,9 @@ class CallbackService:
             logger.error(f"error while updating user wallet {str(e)}")
             content = send_wallet_top_up_failed_notification()
             fcm_service.send_notification_to_user_from_template(content, user_id=user_id)
-            return ResponseHelper.success_response()
+            # Raise so the event is recorded as failed and retried; the order is still pending, so
+            # the duplicate-credit guard above lets the retry through exactly once.
+            raise
 
     async def __handle_event_for_order(self, order: UserOrderModel, iccid: str, event_type: str,
                                        esim_order_id: str = None):
