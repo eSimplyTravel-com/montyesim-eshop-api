@@ -8,6 +8,21 @@ class UserOrderRepo(BaseRepository):
         super().__init__(DatabaseTables.TABLE_USER_ORDER, UserOrderModel)
 
 
+class OrderFulfilmentLock:
+    """Exactly-one-worker lock around the non-idempotent eSIM Hub call."""
+
+    LEASE_SECONDS = 15 * 60
+
+    def __init__(self, repo: "UserOrderRepo"):
+        self.__repo = repo
+
+    def acquire(self, order_id: str) -> bool:
+        return bool(self.__repo.client.rpc("claim_order_fulfilment", {
+            "p_order_id": str(order_id),
+            "p_lease_seconds": self.LEASE_SECONDS,
+        }).execute().data)
+
+
 class UserProfileRepo(BaseRepository):
     def __init__(self):
         super().__init__(DatabaseTables.TABLE_USER_PROFILE, UserProfileModel)

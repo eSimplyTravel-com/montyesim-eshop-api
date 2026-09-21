@@ -93,6 +93,9 @@ class TestBundleService(unittest.IsolatedAsyncioTestCase):
         self.bundle_service._BundleService__tag_repo = self.mock_tag_repo
         self.bundle_service._BundleService__bundle_tag_repo = self.mock_bundle_tag_repo
         self.bundle_service._BundleService__user_order_repo = self.mock_user_order_repo
+        # The fulfilment lock guards the non-idempotent hub call; these tests exercise the happy path.
+        self.bundle_service._BundleService__fulfilment_lock = MagicMock()
+        self.bundle_service._BundleService__fulfilment_lock.acquire.return_value = True
         self.bundle_service._BundleService__user_repo = self.mock_user_repo
         self.bundle_service._BundleService__user_profile_repo = self.mock_user_profile_repo
         self.bundle_service._BundleService__user_profile_bundle_repo = self.mock_user_profile_bundle_repo

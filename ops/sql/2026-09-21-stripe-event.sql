@@ -66,3 +66,31 @@ begin
     return updated > 0;
 end;
 $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- Order-level fulfilment lock (montyesim-eshop-api#7).
+-- Ordering at the eSIM Hub is not idempotent and the hub has no lookup by our identifier, so
+-- exactly one worker may ever be inside that call for a given order.
+alter table public.user_order add column if not exists fulfilment_claimed_at timestamptz;
+
+create or replace function public.claim_order_fulfilment(p_order_id text, p_lease_seconds integer)
+returns boolean
+language plpgsql
+as $$
+declare
+    updated integer;
+begin
+    update public.user_order
+       set order_status = 'fulfilling',
+           fulfilment_claimed_at = now()
+     where id::text = p_order_id
+       and esim_order_id is null              -- already ordered at the hub: never claim again
+       and (
+            order_status in ('pending', 'failure')
+            or (order_status = 'fulfilling'
+                and fulfilment_claimed_at < now() - make_interval(secs => p_lease_seconds))
+       );
+    get diagnostics updated = row_count;
+    return updated > 0;
+end;
+$$;
