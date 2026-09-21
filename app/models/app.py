@@ -15,10 +15,15 @@ class AppConfigModel(BaseModel):
 class StripeEventModel(BaseModel):
     id: str
     type: Optional[str] = None
+    payload: Optional[str] = None
+    api_version: Optional[str] = None
     status: Optional[str] = None
     attempts: Optional[int] = 0
     last_error: Optional[str] = None
     created_at: Optional[str] = None
+    claimed_at: Optional[str] = None
+    claimed_by: Optional[str] = None
+    next_attempt_at: Optional[str] = None
     processed_at: Optional[str] = None
 
 

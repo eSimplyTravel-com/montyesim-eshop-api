@@ -1,21 +1,37 @@
 -- Durable record of every Stripe webhook event (montyesim-eshop-api#6).
--- Run in Supabase SQL editor BEFORE merging the PR; the code needs the table.
+-- Run in the Supabase SQL editor BEFORE merging the PR; the code needs the table.
 create table if not exists public.stripe_event (
-    id            text primary key,              -- Stripe event id: blocks duplicate deliveries
-    type          text,
-    status        text not null default 'pending', -- pending | processing | processed | failed
-    attempts      integer not null default 0,
-    last_error    text,
-    created_at    timestamptz not null default now(),
-    processed_at  timestamptz
+    id              text primary key,                 -- Stripe event id: blocks duplicate deliveries
+    type            text,
+    payload         text,                             -- the verified event, so retries never depend
+                                                      -- on Stripe's 30-day event retention
+    api_version     text,
+    status          text not null default 'pending',  -- pending|processing|processed|failed|dead
+    attempts        integer not null default 0,
+    last_error      text,
+    claimed_at      timestamptz,                      -- lease start; a stale one may be reclaimed
+    claimed_by      text,                             -- owner token; required to write the result
+    next_attempt_at timestamptz default now(),
+    created_at      timestamptz not null default now(),
+    processed_at    timestamptz
 );
 
-create index if not exists stripe_event_status_created_idx
-    on public.stripe_event (status, created_at);
+create index if not exists stripe_event_retry_idx
+    on public.stripe_event (status, next_attempt_at);
+create index if not exists stripe_event_claimed_idx
+    on public.stripe_event (status, claimed_at);
 
--- The API connects with the service role, which bypasses RLS. Enable RLS with no policies
--- so that the anon/authenticated keys cannot read payment events.
+-- The API connects with the service role, which bypasses RLS. Enable RLS with no policies so the
+-- anon/authenticated keys cannot read payment events.
 alter table public.stripe_event enable row level security;
 
--- Check afterwards:
--- select status, count(*) from public.stripe_event group by status;
+-- If the table already existed from an earlier attempt, make sure the newer columns are there:
+alter table public.stripe_event add column if not exists payload text;
+alter table public.stripe_event add column if not exists api_version text;
+alter table public.stripe_event add column if not exists claimed_at timestamptz;
+alter table public.stripe_event add column if not exists claimed_by text;
+alter table public.stripe_event add column if not exists next_attempt_at timestamptz default now();
+
+-- Checks to run after the deploy:
+-- select status, count(*) from public.stripe_event group by status;                 -- expect processed
+-- select id, type, attempts, last_error from public.stripe_event where status = 'dead';  -- expect none

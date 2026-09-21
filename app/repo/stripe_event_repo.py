@@ -1,7 +1,9 @@
-from datetime import datetime, timezone
-from typing import List
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
 
 from app.config.db import DatabaseTables
+from app.exceptions import DatabaseException
 from app.models.app import StripeEventModel
 from app.repo.base_repo import BaseRepository
 
@@ -9,48 +11,117 @@ STATUS_PENDING = "pending"
 STATUS_PROCESSING = "processing"
 STATUS_PROCESSED = "processed"
 STATUS_FAILED = "failed"
+STATUS_DEAD = "dead"
+
+# Marks a row whose worker never came back (deploy, crash, OOM) as safe to pick up again.
+LEASE_SECONDS = 15 * 60
+RETRYABLE_STATUSES = [STATUS_PENDING, STATUS_FAILED]
+
+
+def _now() -> datetime:
+    return datetime.now(tz=timezone.utc)
+
+
+class DuplicateEventError(Exception):
+    """Stripe delivered an event we already recorded."""
 
 
 class StripeEventRepo(BaseRepository):
     def __init__(self):
         super().__init__(DatabaseTables.TABLE_STRIPE_EVENT, StripeEventModel)
 
-    def record(self, event_id: str, event_type: str) -> bool:
-        """Insert the event. Returns False when Stripe delivered it before (primary key clash)."""
+    def record(self, event_id: str, event_type: str, payload: str, api_version: str = None) -> None:
+        """Persist the event. Raises DuplicateEventError on redelivery, DatabaseException otherwise.
+
+        The distinction matters: a duplicate is safe to acknowledge, any other failure means the
+        event is NOT stored and Stripe must be asked to send it again.
+        """
         try:
-            self.create({"id": event_id, "type": event_type, "status": STATUS_PENDING, "attempts": 0})
-            return True
-        except Exception:
-            return False
+            self.table.insert({
+                "id": event_id,
+                "type": event_type,
+                "payload": payload,
+                "api_version": api_version,
+                "status": STATUS_PENDING,
+                "attempts": 0,
+                "next_attempt_at": _now().isoformat(),
+            }).execute()
+        except Exception as e:
+            if self.__is_duplicate(e):
+                raise DuplicateEventError(event_id)
+            raise DatabaseException(str(e))
 
-    def claim(self, event_id: str) -> bool:
-        """Move one event to processing. Returns False if another worker already holds it."""
-        rows = self.update_by(where={"id": event_id, "status": STATUS_PENDING}, data={"status": STATUS_PROCESSING})
-        return bool(rows)
+    @staticmethod
+    def __is_duplicate(error: Exception) -> bool:
+        code = getattr(error, "code", None)
+        message = f"{getattr(error, 'message', '')} {error}".lower()
+        return code == "23505" or "duplicate key" in message or "already exists" in message
 
-    def claim_failed(self, event_id: str) -> bool:
-        rows = self.update_by(where={"id": event_id, "status": STATUS_FAILED}, data={"status": STATUS_PROCESSING})
-        return bool(rows)
+    def claim(self, event_id: str) -> Optional[str]:
+        """Take ownership of one event. Returns a token, or None if someone else holds it.
 
-    def mark_processed(self, event_id: str) -> None:
-        self.update_by(where={"id": event_id},
-                       data={"status": STATUS_PROCESSED,
-                             "processed_at": datetime.now(tz=timezone.utc).isoformat(),
-                             "last_error": None})
+        Claimable: pending, failed, or a processing row whose lease has expired.
+        """
+        current = self.get_by_id(event_id)
+        if not current:
+            return None
+        token = str(uuid.uuid4())
+        data = {
+            "status": STATUS_PROCESSING,
+            "claimed_at": _now().isoformat(),
+            "claimed_by": token,
+            "attempts": int(current.attempts or 0) + 1,
+        }
+        for status in RETRYABLE_STATUSES:
+            rows = self.table.update(data).eq("id", event_id).eq("status", status).execute().data
+            if rows:
+                return token
+        expired_before = (_now() - timedelta(seconds=LEASE_SECONDS)).isoformat()
+        rows = self.table.update(data).eq("id", event_id).eq("status", STATUS_PROCESSING) \
+            .lt("claimed_at", expired_before).execute().data
+        return token if rows else None
 
-    def mark_failed(self, event_id: str, attempts: int, error: str) -> None:
-        self.update_by(where={"id": event_id},
-                       data={"status": STATUS_FAILED, "attempts": attempts, "last_error": str(error)[:1000]})
+    def mark_processed(self, event_id: str, token: str) -> None:
+        # claimed_by guards against a superseded worker overwriting a newer result.
+        self.table.update({"status": STATUS_PROCESSED, "processed_at": _now().isoformat(),
+                           "last_error": None}) \
+            .eq("id", event_id).eq("claimed_by", token).execute()
 
-    def get_attempts(self, event_id: str) -> int:
-        event = self.get_by_id(event_id)
-        return int(event.attempts or 0) if event else 0
+    def mark_failed(self, event_id: str, token: str, error: str, max_attempts: int,
+                    backoff_seconds: int) -> str:
+        """Schedule a retry, or park the event as dead once the budget is spent."""
+        current = self.get_by_id(event_id)
+        attempts = int(current.attempts or 0) if current else max_attempts
+        status = STATUS_DEAD if attempts >= max_attempts else STATUS_FAILED
+        self.table.update({
+            "status": status,
+            "last_error": str(error)[:1000],
+            "next_attempt_at": (_now() + timedelta(seconds=backoff_seconds * attempts)).isoformat(),
+        }).eq("id", event_id).eq("claimed_by", token).execute()
+        return status
 
     def list_retryable(self, max_attempts: int, limit: int = 20) -> List[StripeEventModel]:
-        """Events left behind by a crash (processing/pending) or a failed attempt."""
-        stuck: List[StripeEventModel] = []
-        for status in (STATUS_FAILED, STATUS_PENDING, STATUS_PROCESSING):
-            for event in self.list(where={"status": status}, limit=limit, order_by="created_at"):
-                if int(event.attempts or 0) < max_attempts:
-                    stuck.append(event)
-        return stuck[:limit]
+        """Events that are due for another run. Filtering happens in the database, so a batch of
+        exhausted rows cannot hide newer ones."""
+        try:
+            expired_before = (_now() - timedelta(seconds=LEASE_SECONDS)).isoformat()
+            due = _now().isoformat()
+            rows = self.table.select("*") \
+                .in_("status", RETRYABLE_STATUSES) \
+                .lt("attempts", max_attempts) \
+                .lte("next_attempt_at", due) \
+                .order("next_attempt_at").limit(limit).execute().data or []
+            stale = self.table.select("*") \
+                .eq("status", STATUS_PROCESSING) \
+                .lt("attempts", max_attempts) \
+                .lt("claimed_at", expired_before) \
+                .order("claimed_at").limit(limit).execute().data or []
+            return [StripeEventModel(**row) for row in (rows + stale)][:limit]
+        except Exception as e:
+            raise DatabaseException(str(e))
+
+    def payload_of(self, event_id: str) -> Tuple[Optional[str], Optional[str]]:
+        rows = self.table.select("payload,api_version").eq("id", event_id).execute().data or []
+        if not rows:
+            return None, None
+        return rows[0].get("payload"), rows[0].get("api_version")

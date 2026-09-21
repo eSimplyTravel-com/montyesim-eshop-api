@@ -21,7 +21,7 @@ from app.config.utils import parse_iso_datetime, truncate_two_decimals_decimal_r
 from app.models.user import OrderStatusEnum, UserOrderType, UsersCopyModel, UserOrderModel, UserProfileBundleModel, \
     UserProfileModel
 from app.repo import UserOrderRepo, UserProfileRepo, UserRepo, UserProfileBundleRepo
-from app.repo.stripe_event_repo import StripeEventRepo
+from app.repo.stripe_event_repo import DuplicateEventError, StripeEventRepo
 from app.schemas.callback import ConsumptionLimitRequest
 from app.schemas.dto_mapper import DtoMapper
 from app.schemas.home import BundleDTO
@@ -134,10 +134,17 @@ class CallbackService:
             raise HTTPException(status_code=400, detail="Invalid signature")
 
         event_id = event.get("id")
-        if not self.__stripe_event_repo.record(event_id=event_id, event_type=event.get("type")):
-            # Stripe redelivers the same event after a timeout; the first delivery owns it.
+        try:
+            self.__stripe_event_repo.record(event_id=event_id, event_type=event.get("type"),
+                                            payload=json.dumps(event, default=str),
+                                            api_version=event.get("api_version"))
+        except DuplicateEventError:
             logger.info(f"stripe event {event_id} already recorded, skipping duplicate delivery")
             return ResponseHelper.success_response()
+        except Exception as e:
+            # Nothing was stored, so do NOT acknowledge: a 500 makes Stripe deliver it again.
+            logger.error(f"STRIPE_EVENT_NOT_RECORDED id={event_id} error={e}")
+            raise HTTPException(status_code=500, detail="Could not record event")
 
         def task():
             return self.process_stripe_event(event_id=event_id, event=event)
@@ -146,43 +153,64 @@ class CallbackService:
 
         return ResponseHelper.success_response()
 
-    def process_stripe_event(self, event_id: str, event, claim_failed: bool = False):
-        """Run one recorded event exactly once, and leave a trace when it does not finish."""
-        claimed = self.__stripe_event_repo.claim_failed(event_id) if claim_failed \
-            else self.__stripe_event_repo.claim(event_id)
-        if not claimed:
-            logger.info(f"stripe event {event_id} is already being handled elsewhere")
+    def process_stripe_event(self, event_id: str, event):
+        """Run one recorded event once. The claim carries a token so a superseded worker cannot
+        overwrite a newer result."""
+        token = self.__stripe_event_repo.claim(event_id)
+        if not token:
+            logger.info(f"stripe event {event_id} is held by another worker")
             return None
-        attempts = self.__stripe_event_repo.get_attempts(event_id) + 1
         try:
             result = self.__handle_payment_webhook_data(event=event)
-            self.__stripe_event_repo.mark_processed(event_id)
+            if isinstance(result, Exception):
+                # buy_bundle/top_up_bundle return the exception instead of raising it.
+                raise result
+            self.__stripe_event_repo.mark_processed(event_id=event_id, token=token)
             return result
         except Exception as e:
-            # Deliberately loud: an unprocessed payment means a paid order without an eSIM.
-            logger.error(f"STRIPE_EVENT_FAILED id={event_id} attempt={attempts} error={e}")
-            self.__stripe_event_repo.mark_failed(event_id=event_id, attempts=attempts, error=str(e))
+            status = self.__stripe_event_repo.mark_failed(
+                event_id=event_id, token=token, error=str(e),
+                max_attempts=self.__max_event_attempts(), backoff_seconds=self.__event_backoff())
+            level = logger.critical if status == "dead" else logger.error
+            level(f"STRIPE_EVENT_FAILED id={event_id} status={status} error={e}")
             return None
 
-    def retry_stripe_events(self, max_attempts: int = 5, limit: int = 20):
-        """Pick up events a restart or an error left unfinished. Called by the scheduler."""
+    @staticmethod
+    def __max_event_attempts() -> int:
+        return int(os.getenv("STRIPE_EVENT_MAX_ATTEMPTS", 5))
+
+    @staticmethod
+    def __event_backoff() -> int:
+        return int(os.getenv("STRIPE_EVENT_BACKOFF_SECONDS", 300))
+
+    def retry_stripe_events(self, limit: int = 20) -> int:
+        """Pick up events that a crash, a restart or an error left unfinished."""
+        max_attempts = self.__max_event_attempts()
         stuck = self.__stripe_event_repo.list_retryable(max_attempts=max_attempts, limit=limit)
-        if not stuck:
-            return 0
-        logger.info(f"retrying {len(stuck)} unfinished stripe events")
         retried = 0
         for record in stuck:
-            try:
-                event = stripe.Event.retrieve(record.id)
-            except Exception as e:
-                logger.error(f"STRIPE_EVENT_FAILED id={record.id} could not be fetched from Stripe: {e}")
+            event = self.__rebuild_event(record.id)
+            if event is None:
                 continue
-            # A crashed run leaves the row in processing/failed, so claim both shapes.
-            self.__stripe_event_repo.update_by(where={"id": record.id, "status": "processing"},
-                                               data={"status": "failed"})
-            self.process_stripe_event(event_id=record.id, event=event, claim_failed=True)
+            self.process_stripe_event(event_id=record.id, event=event)
             retried += 1
+        if retried:
+            logger.info(f"retried {retried} unfinished stripe events")
         return retried
+
+    def __rebuild_event(self, event_id: str):
+        """Prefer the payload we stored; Stripe only serves events for 30 days."""
+        payload, _ = self.__stripe_event_repo.payload_of(event_id)
+        if payload:
+            try:
+                return json.loads(payload)
+            except Exception as e:
+                logger.error(f"STRIPE_EVENT_FAILED id={event_id} stored payload unreadable: {e}")
+        try:
+            return stripe.Event.retrieve(event_id)
+        except Exception as e:
+            logger.error(f"STRIPE_EVENT_FAILED id={event_id} could not be rebuilt: {e}")
+            return None
 
     async def handle_payment_webhook_fake(self, request: Request):
         try:
