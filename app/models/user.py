@@ -46,6 +46,9 @@ class UserOrderModel(BaseModel):
     otp: Optional[str] = None
     payment_type: Optional[PaymentTypeEnum] = PaymentTypeEnum.CARD
     otp_expired_at: Optional[str] = None
+    # Written only by the claim_order_fulfilment() lock. Declared here because UserOrderModel
+    # forbids extra fields: without it, adding the column breaks every order read.
+    fulfilment_claimed_at: Optional[str] = None
     tax_amount: Optional[float] = 0.0
 
     model_config = ConfigDict(from_attributes=True, extra="forbid")
