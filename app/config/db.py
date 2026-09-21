@@ -78,6 +78,7 @@ class DatabaseTables(StrEnum):
     TABLE_CONTACT_US = "contact_us"
     TABLE_NOTIFICATION = "notification"
     TABLE_APP_CONFIG = "app_config"
+    TABLE_STRIPE_EVENT = "stripe_event"
     TABLE_BANNER = "banner"
 
     TABLE_PROMOTION_RULE_ACTION = "promotion_rule_action"

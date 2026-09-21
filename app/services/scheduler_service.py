@@ -98,9 +98,29 @@ class SchedulerService:
             coalesce=True,
             misfire_grace_time=misfire_grace,
         )
+        retry_seconds = int(os.getenv("STRIPE_EVENT_RETRY_SECONDS", 300))
+        self.scheduler.add_job(
+            self.__retry_stripe_events,
+            trigger=IntervalTrigger(seconds=retry_seconds),
+            id="retry_stripe_events",
+            name="Retry unfinished Stripe events",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=misfire_grace,
+        )
         self.scheduler.start()
         self.__started = True
         logger.info("Scheduler started")
+
+    @staticmethod
+    def __retry_stripe_events():
+        # Imported here: CallbackService pulls in the bundle/sync services and would make the import circular.
+        from app.services.callback_service import CallbackService
+        try:
+            CallbackService().retry_stripe_events()
+        except Exception as e:
+            logger.error(f"STRIPE_EVENT_RETRY_FAILED {e}")
 
     def shutdown_scheduler(self):
         self.scheduler.shutdown(wait=False)

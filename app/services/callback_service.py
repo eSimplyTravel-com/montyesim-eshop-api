@@ -21,6 +21,7 @@ from app.config.utils import parse_iso_datetime, truncate_two_decimals_decimal_r
 from app.models.user import OrderStatusEnum, UserOrderType, UsersCopyModel, UserOrderModel, UserProfileBundleModel, \
     UserProfileModel
 from app.repo import UserOrderRepo, UserProfileRepo, UserRepo, UserProfileBundleRepo
+from app.repo.stripe_event_repo import DuplicateEventError, StripeEventRepo
 from app.schemas.callback import ConsumptionLimitRequest
 from app.schemas.dto_mapper import DtoMapper
 from app.schemas.home import BundleDTO
@@ -52,6 +53,7 @@ class CallbackService:
         self.__promotion_service = PromotionService()
         self.__bundle_service = BundleService()
         self.__task_executor = TaskExecutor()
+        self.__stripe_event_repo = StripeEventRepo()
 
     def _execute_sync_request(self, sync_request: SyncRequest):
         """Execute a single sync request"""
@@ -131,12 +133,132 @@ class CallbackService:
             logger.error("Stripe webhook signature verification failed.")
             raise HTTPException(status_code=400, detail="Invalid signature")
 
+        event_id = event.get("id")
+        try:
+            self.__stripe_event_repo.record(event_id=event_id, event_type=event.get("type"),
+                                            payload=json.dumps(event, default=str),
+                                            api_version=event.get("api_version"))
+        except DuplicateEventError:
+            logger.info(f"stripe event {event_id} already recorded, skipping duplicate delivery")
+            return ResponseHelper.success_response()
+        except Exception as e:
+            # Nothing was stored, so do NOT acknowledge: a 500 makes Stripe deliver it again.
+            logger.error(f"STRIPE_EVENT_NOT_RECORDED id={event_id} error={e}")
+            raise HTTPException(status_code=500, detail="Could not record event")
+
         def task():
-            return self.__handle_payment_webhook_data(event=event)
+            return self.process_stripe_event(event_id=event_id, event=event)
 
         self.__task_executor.add_task(task)
 
         return ResponseHelper.success_response()
+
+    def process_stripe_event(self, event_id: str, event):
+        """Run one recorded event once. The claim carries a token so a superseded worker cannot
+        overwrite a newer result."""
+        token = self.__stripe_event_repo.claim(event_id, max_attempts=self.__max_event_attempts())
+        if not token:
+            logger.info(f"stripe event {event_id} is held by another worker")
+            return None
+        try:
+            state = self.__fulfilment_state(event)
+            if state == "done":
+                logger.info(f"stripe event {event_id} targets an order that Monty already fulfilled; "
+                            f"recording it without ordering again")
+                self.__stripe_event_repo.mark_processed(event_id=event_id, token=token)
+                return None
+            if state == "unknown":
+                # Fail closed: running fulfilment blind could order a second eSIM.
+                raise RuntimeError("could not establish fulfilment state; retrying later")
+            result = self.__handle_payment_webhook_data(event=event)
+            if isinstance(result, Exception) and not self.__is_handled_result(result):
+                # buy_bundle/top_up_bundle return the exception instead of raising it.
+                raise result
+            self.__stripe_event_repo.mark_processed(event_id=event_id, token=token)
+            return result
+        except Exception as e:
+            status = self.__stripe_event_repo.mark_failed(
+                event_id=event_id, token=token, error=str(e),
+                max_attempts=self.__max_event_attempts(), backoff_seconds=self.__event_backoff())
+            level = logger.critical if status == "dead" else logger.error
+            level(f"STRIPE_EVENT_FAILED id={event_id} status={status} error={e}")
+            return None
+
+    def __fulfilment_state(self, event) -> str:
+        """"done" only when the eSIM was actually ordered at Monty. payment_status is NOT that
+        marker: it is set to success even when the hub call fails (bundle_service.py:205-214).
+        Returns "unknown" when we cannot tell, and the caller then refuses to run fulfilment."""
+        if event.get("type") != "payment_intent.succeeded":
+            return "open"
+        try:
+            metadata = (event.get("data", {}).get("object", {}) or {}).get("metadata") or {}
+            order_id = metadata.get("order_id")
+            if not order_id:
+                return "open"
+            order = self.__user_order_repo.get_by_id(order_id)
+            if not order:
+                return "open"
+            if order.order_status == OrderStatusEnum.SUCCESS and order.esim_order_id:
+                return "done"
+            return "open"
+        except Exception as e:
+            logger.error(f"could not read fulfilment state for event {event.get('id')}: {e}")
+            return "unknown"
+
+    @staticmethod
+    def __is_handled_result(result) -> bool:
+        # A declined or canceled payment is handled by returning HTTPException(200, "Payment Failed").
+        # That is a finished event, not a failure to retry.
+        return isinstance(result, HTTPException) and result.status_code < 400
+
+    @staticmethod
+    def __max_event_attempts() -> int:
+        return int(os.getenv("STRIPE_EVENT_MAX_ATTEMPTS", 5))
+
+    @staticmethod
+    def __event_backoff() -> int:
+        return int(os.getenv("STRIPE_EVENT_BACKOFF_SECONDS", 300))
+
+    def retry_stripe_events(self, limit: int = 20) -> int:
+        """Pick up events that a crash, a restart or an error left unfinished."""
+        max_attempts = self.__max_event_attempts()
+        stuck = self.__stripe_event_repo.list_retryable(max_attempts=max_attempts, limit=limit)
+        for abandoned in self.__stripe_event_repo.list_abandoned(max_attempts=max_attempts, limit=limit):
+            if self.__stripe_event_repo.mark_dead(abandoned.id, token=abandoned.claimed_by,
+                                                  error="worker disappeared on the final attempt"):
+                logger.critical(f"STRIPE_EVENT_FAILED id={abandoned.id} status=dead "
+                                f"error=worker disappeared on the final attempt")
+        retried = 0
+        for record in stuck:
+            event = self.__rebuild_event(record.id)
+            if event is None:
+                # Count it, so an event we can never rebuild ends as dead instead of blocking
+                # the oldest slots of every future batch.
+                token = self.__stripe_event_repo.claim(record.id, max_attempts=max_attempts)
+                if token:
+                    self.__stripe_event_repo.mark_failed(
+                        event_id=record.id, token=token, error="event could not be rebuilt",
+                        max_attempts=max_attempts, backoff_seconds=self.__event_backoff())
+                continue
+            self.process_stripe_event(event_id=record.id, event=event)
+            retried += 1
+        if retried:
+            logger.info(f"retried {retried} unfinished stripe events")
+        return retried
+
+    def __rebuild_event(self, event_id: str):
+        """Prefer the payload we stored; Stripe only serves events for 30 days."""
+        payload, _ = self.__stripe_event_repo.payload_of(event_id)
+        if payload:
+            try:
+                return json.loads(payload)
+            except Exception as e:
+                logger.error(f"STRIPE_EVENT_FAILED id={event_id} stored payload unreadable: {e}")
+        try:
+            return stripe.Event.retrieve(event_id)
+        except Exception as e:
+            logger.error(f"STRIPE_EVENT_FAILED id={event_id} could not be rebuilt: {e}")
+            return None
 
     async def handle_payment_webhook_fake(self, request: Request):
         try:
