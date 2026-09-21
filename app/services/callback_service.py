@@ -156,13 +156,18 @@ class CallbackService:
     def process_stripe_event(self, event_id: str, event):
         """Run one recorded event once. The claim carries a token so a superseded worker cannot
         overwrite a newer result."""
-        token = self.__stripe_event_repo.claim(event_id)
+        token = self.__stripe_event_repo.claim(event_id, max_attempts=self.__max_event_attempts())
         if not token:
             logger.info(f"stripe event {event_id} is held by another worker")
             return None
         try:
+            if self.__already_fulfilled(event):
+                logger.info(f"stripe event {event_id} targets an order that is already successful; "
+                            f"recording it without running fulfilment again")
+                self.__stripe_event_repo.mark_processed(event_id=event_id, token=token)
+                return None
             result = self.__handle_payment_webhook_data(event=event)
-            if isinstance(result, Exception):
+            if isinstance(result, Exception) and not self.__is_handled_result(result):
                 # buy_bundle/top_up_bundle return the exception instead of raising it.
                 raise result
             self.__stripe_event_repo.mark_processed(event_id=event_id, token=token)
@@ -174,6 +179,28 @@ class CallbackService:
             level = logger.critical if status == "dead" else logger.error
             level(f"STRIPE_EVENT_FAILED id={event_id} status={status} error={e}")
             return None
+
+    def __already_fulfilled(self, event) -> bool:
+        """Guards the replay path: ordering at Monty is not idempotent, so an order that is already
+        marked successful must never be fulfilled a second time."""
+        try:
+            if event.get("type") != "payment_intent.succeeded":
+                return False
+            metadata = (event.get("data", {}).get("object", {}) or {}).get("metadata") or {}
+            order_id = metadata.get("order_id")
+            if not order_id:
+                return False
+            order = self.__user_order_repo.get_by_id(order_id)
+            return bool(order and order.payment_status == OrderStatusEnum.SUCCESS)
+        except Exception as e:
+            logger.error(f"could not check fulfilment state for event {event.get('id')}: {e}")
+            return False
+
+    @staticmethod
+    def __is_handled_result(result) -> bool:
+        # A declined or canceled payment is handled by returning HTTPException(200, "Payment Failed").
+        # That is a finished event, not a failure to retry.
+        return isinstance(result, HTTPException) and result.status_code < 400
 
     @staticmethod
     def __max_event_attempts() -> int:
@@ -187,6 +214,10 @@ class CallbackService:
         """Pick up events that a crash, a restart or an error left unfinished."""
         max_attempts = self.__max_event_attempts()
         stuck = self.__stripe_event_repo.list_retryable(max_attempts=max_attempts, limit=limit)
+        for abandoned in self.__stripe_event_repo.list_abandoned(max_attempts=max_attempts, limit=limit):
+            logger.critical(f"STRIPE_EVENT_FAILED id={abandoned.id} status=dead "
+                            f"error=worker disappeared on the final attempt")
+            self.__stripe_event_repo.mark_dead(abandoned.id, "worker disappeared on the final attempt")
         retried = 0
         for record in stuck:
             event = self.__rebuild_event(record.id)

@@ -65,6 +65,7 @@ def _event():
 def test_record_raises_duplicate_on_primary_key_clash(repo):
     error = Exception('duplicate key value violates unique constraint "stripe_event_pkey"')
     repo.table.insert.return_value.execute.side_effect = error
+    repo.table.select.return_value = FakeQuery([{"id": "evt_1"}], [])  # the row really is there
     with pytest.raises(DuplicateEventError):
         repo.record("evt_1", "payment_intent.succeeded", payload="{}")
 
@@ -117,7 +118,7 @@ def _claim_repo(repo, rows_per_update, current_attempts=0):
 
 def test_claim_takes_a_pending_event_and_counts_the_attempt(repo):
     queries = _claim_repo(repo, [[{"id": "evt_1"}]], current_attempts=2)
-    token = repo.claim("evt_1")
+    token = repo.claim("evt_1", max_attempts=5)
     assert token
     assert queries[0].data_sent["attempts"] == 3
     assert queries[0].data_sent["claimed_by"] == token
@@ -126,21 +127,20 @@ def test_claim_takes_a_pending_event_and_counts_the_attempt(repo):
 def test_claim_refuses_an_event_another_worker_is_running(repo):
     # pending -> no rows, failed -> no rows, expired processing -> no rows
     _claim_repo(repo, [None, None, None])
-    assert repo.claim("evt_1") is None
+    assert repo.claim("evt_1", max_attempts=5) is None
 
 
 def test_claim_reclaims_an_event_whose_lease_expired(repo):
     queries = _claim_repo(repo, [None, None, [{"id": "evt_1"}]])
-    assert repo.claim("evt_1")
-    cutoff = [c for c in queries[2].calls if c[0] == "lt"][0][1]
-    assert cutoff[0] == "claimed_at"
+    assert repo.claim("evt_1", max_attempts=5)
+    cutoff = [c[1] for c in queries[2].calls if c[0] == "lt" and c[1][0] == "claimed_at"][0]
     age = datetime.now(tz=timezone.utc) - datetime.fromisoformat(cutoff[1])
     assert timedelta(seconds=LEASE_SECONDS - 60) < age < timedelta(seconds=LEASE_SECONDS + 60)
 
 
 def test_claim_returns_none_for_an_unknown_event(repo):
     repo.get_by_id = MagicMock(return_value=None)
-    assert repo.claim("evt_missing") is None
+    assert repo.claim("evt_missing", max_attempts=5) is None
 
 
 def test_result_writes_require_the_owner_token(repo):
@@ -245,3 +245,80 @@ def test_retry_skips_an_event_it_cannot_rebuild(service):
 def test_retry_does_nothing_when_everything_is_done(service):
     service._CallbackService__stripe_event_repo.list_retryable.return_value = []
     assert service.retry_stripe_events() == 0
+
+
+# --- fixes from the second review ---------------------------------------------------------------
+
+def test_conflict_without_an_existing_row_is_not_treated_as_duplicate(repo):
+    # A different constraint or trigger can also say "duplicate key"; that must stay retryable.
+    repo.table.insert.return_value.execute.side_effect = Exception("duplicate key on some other index")
+    repo.table.select.return_value = FakeQuery([], [])
+    with pytest.raises(DatabaseException):
+        repo.record("evt_1", "payment_intent.succeeded", payload="{}")
+
+
+def test_claim_enforces_the_attempt_cap_and_backoff_at_acquisition(repo):
+    queries = _claim_repo(repo, [[{"id": "evt_1"}]])
+    repo.claim("evt_1", max_attempts=5)
+    assert ("lt", ("attempts", 5)) in queries[0].calls
+    assert any(call[0] == "lte" and call[1][0] == "next_attempt_at" for call in queries[0].calls)
+
+
+def test_abandoned_final_attempt_is_swept_into_dead(service):
+    service._CallbackService__stripe_event_repo.list_abandoned.return_value = [MagicMock(id="evt_dead")]
+    service._CallbackService__stripe_event_repo.list_retryable.return_value = []
+    assert service.retry_stripe_events() == 0
+    service._CallbackService__stripe_event_repo.mark_dead.assert_called_once()
+
+
+def test_declined_payment_is_not_retried(service):
+    from fastapi import HTTPException
+    service._CallbackService__stripe_event_repo.claim.return_value = "tok"
+    service._CallbackService__user_order_repo = MagicMock()
+    with patch.object(CallbackService, "_CallbackService__handle_payment_webhook_data",
+                      return_value=HTTPException(status_code=200, detail="Payment Failed")):
+        service.process_stripe_event("evt_1", {"id": "evt_1", "type": "payment_intent.payment_failed"})
+    service._CallbackService__stripe_event_repo.mark_processed.assert_called_once()
+    service._CallbackService__stripe_event_repo.mark_failed.assert_not_called()
+
+
+def test_replay_never_fulfils_an_order_that_already_succeeded(service):
+    from app.models.user import OrderStatusEnum
+    service._CallbackService__stripe_event_repo.claim.return_value = "tok"
+    service._CallbackService__user_order_repo = MagicMock()
+    service._CallbackService__user_order_repo.get_by_id.return_value = MagicMock(
+        payment_status=OrderStatusEnum.SUCCESS)
+    event = {"id": "evt_1", "type": "payment_intent.succeeded",
+             "data": {"object": {"metadata": {"order_id": "ord_1"}}}}
+    with patch.object(CallbackService, "_CallbackService__handle_payment_webhook_data") as handler:
+        service.process_stripe_event("evt_1", event)
+        handler.assert_not_called()  # ordering at Monty is not idempotent
+    service._CallbackService__stripe_event_repo.mark_processed.assert_called_once()
+
+
+def test_first_delivery_of_a_pending_order_still_runs(service):
+    from app.models.user import OrderStatusEnum
+    service._CallbackService__stripe_event_repo.claim.return_value = "tok"
+    service._CallbackService__user_order_repo = MagicMock()
+    service._CallbackService__user_order_repo.get_by_id.return_value = MagicMock(
+        payment_status=OrderStatusEnum.PENDING)
+    event = {"id": "evt_1", "type": "payment_intent.succeeded",
+             "data": {"object": {"metadata": {"order_id": "ord_1"}}}}
+    with patch.object(CallbackService, "_CallbackService__handle_payment_webhook_data",
+                      return_value="ok") as handler:
+        assert service.process_stripe_event("evt_1", event) == "ok"
+        handler.assert_called_once()
+
+
+def test_due_rows_cannot_starve_crash_recovery(repo):
+    due = [{"id": f"due_{i}", "status": "failed", "attempts": 0} for i in range(20)]
+    stale = [{"id": "stale_1", "status": "processing", "attempts": 1}]
+    calls = {"n": 0}
+
+    def select(*_args, **_kwargs):
+        calls["n"] += 1
+        return FakeQuery(due if calls["n"] == 1 else stale, [])
+
+    repo.table.select.side_effect = select
+    ids = [e.id for e in repo.list_retryable(max_attempts=5, limit=20)]
+    assert "stale_1" in ids and len(ids) == 20

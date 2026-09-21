@@ -16,6 +16,18 @@ create table if not exists public.stripe_event (
     processed_at    timestamptz
 );
 
+-- If the table already existed from an earlier attempt, make sure the newer columns are there:
+alter table public.stripe_event add column if not exists payload text;
+alter table public.stripe_event add column if not exists api_version text;
+alter table public.stripe_event add column if not exists claimed_at timestamptz;
+alter table public.stripe_event add column if not exists claimed_by text;
+alter table public.stripe_event add column if not exists next_attempt_at timestamptz default now();
+
+-- Legacy rows from the first version of this table have no lease or due time; without these they
+-- could never be claimed or reclaimed.
+update public.stripe_event set next_attempt_at = coalesce(next_attempt_at, now()) where next_attempt_at is null;
+update public.stripe_event set claimed_at = coalesce(claimed_at, created_at) where status = 'processing' and claimed_at is null;
+
 create index if not exists stripe_event_retry_idx
     on public.stripe_event (status, next_attempt_at);
 create index if not exists stripe_event_claimed_idx
@@ -24,13 +36,6 @@ create index if not exists stripe_event_claimed_idx
 -- The API connects with the service role, which bypasses RLS. Enable RLS with no policies so the
 -- anon/authenticated keys cannot read payment events.
 alter table public.stripe_event enable row level security;
-
--- If the table already existed from an earlier attempt, make sure the newer columns are there:
-alter table public.stripe_event add column if not exists payload text;
-alter table public.stripe_event add column if not exists api_version text;
-alter table public.stripe_event add column if not exists claimed_at timestamptz;
-alter table public.stripe_event add column if not exists claimed_by text;
-alter table public.stripe_event add column if not exists next_attempt_at timestamptz default now();
 
 -- Checks to run after the deploy:
 -- select status, count(*) from public.stripe_event group by status;                 -- expect processed

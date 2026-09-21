@@ -47,17 +47,25 @@ class StripeEventRepo(BaseRepository):
                 "next_attempt_at": _now().isoformat(),
             }).execute()
         except Exception as e:
-            if self.__is_duplicate(e):
+            # Only an existing row with this id proves a duplicate; any other constraint or
+            # transport error must stay retryable, or we would acknowledge a lost event.
+            if self.__looks_like_conflict(e) and self.__exists(event_id):
                 raise DuplicateEventError(event_id)
             raise DatabaseException(str(e))
 
     @staticmethod
-    def __is_duplicate(error: Exception) -> bool:
+    def __looks_like_conflict(error: Exception) -> bool:
         code = getattr(error, "code", None)
         message = f"{getattr(error, 'message', '')} {error}".lower()
         return code == "23505" or "duplicate key" in message or "already exists" in message
 
-    def claim(self, event_id: str) -> Optional[str]:
+    def __exists(self, event_id: str) -> bool:
+        try:
+            return bool(self.table.select("id").eq("id", event_id).execute().data)
+        except Exception:
+            return False
+
+    def claim(self, event_id: str, max_attempts: int) -> Optional[str]:
         """Take ownership of one event. Returns a token, or None if someone else holds it.
 
         Claimable: pending, failed, or a processing row whose lease has expired.
@@ -72,13 +80,17 @@ class StripeEventRepo(BaseRepository):
             "claimed_by": token,
             "attempts": int(current.attempts or 0) + 1,
         }
+        now = _now().isoformat()
         for status in RETRYABLE_STATUSES:
-            rows = self.table.update(data).eq("id", event_id).eq("status", status).execute().data
+            # The filters enforce eligibility at acquisition, not just at selection: a row that
+            # another worker already pushed over the cap or into a backoff window cannot be taken.
+            rows = self.table.update(data).eq("id", event_id).eq("status", status) \
+                .lt("attempts", max_attempts).lte("next_attempt_at", now).execute().data
             if rows:
                 return token
         expired_before = (_now() - timedelta(seconds=LEASE_SECONDS)).isoformat()
         rows = self.table.update(data).eq("id", event_id).eq("status", STATUS_PROCESSING) \
-            .lt("claimed_at", expired_before).execute().data
+            .lt("attempts", max_attempts).lt("claimed_at", expired_before).execute().data
         return token if rows else None
 
     def mark_processed(self, event_id: str, token: str) -> None:
@@ -100,6 +112,19 @@ class StripeEventRepo(BaseRepository):
         }).eq("id", event_id).eq("claimed_by", token).execute()
         return status
 
+    def list_abandoned(self, max_attempts: int, limit: int = 20) -> List[StripeEventModel]:
+        """Rows whose worker died on the last permitted attempt: they can never be claimed again,
+        so nothing would ever move them to dead."""
+        expired_before = (_now() - timedelta(seconds=LEASE_SECONDS)).isoformat()
+        rows = self.table.select("*").eq("status", STATUS_PROCESSING) \
+            .gte("attempts", max_attempts).lt("claimed_at", expired_before) \
+            .order("claimed_at").limit(limit).execute().data or []
+        return [StripeEventModel(**row) for row in rows]
+
+    def mark_dead(self, event_id: str, error: str) -> None:
+        self.table.update({"status": STATUS_DEAD, "last_error": str(error)[:1000]}) \
+            .eq("id", event_id).execute()
+
     def list_retryable(self, max_attempts: int, limit: int = 20) -> List[StripeEventModel]:
         """Events that are due for another run. Filtering happens in the database, so a batch of
         exhausted rows cannot hide newer ones."""
@@ -116,7 +141,11 @@ class StripeEventRepo(BaseRepository):
                 .lt("attempts", max_attempts) \
                 .lt("claimed_at", expired_before) \
                 .order("claimed_at").limit(limit).execute().data or []
-            return [StripeEventModel(**row) for row in (rows + stale)][:limit]
+            # Interleave so a steady stream of due rows cannot starve crash recovery.
+            merged, half = [], max(1, limit // 2)
+            merged.extend(rows[:limit - min(len(stale), half)])
+            merged.extend(stale[:limit - len(merged)])
+            return [StripeEventModel(**row) for row in merged][:limit]
         except Exception as e:
             raise DatabaseException(str(e))
 
