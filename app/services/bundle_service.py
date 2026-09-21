@@ -11,10 +11,12 @@ from app.config.helper import get_config
 from app.config.notification_types import send_buy_bundle_notification, send_buy_topup_notification
 from app.config.push_notification_manager import fcm_service
 from app.config.utils import usd_cents_to_amount
-from app.exceptions import BadRequestException
+from app.exceptions import (BadRequestException, EsimHubUnknownOutcomeError,
+                            FulfilmentNeedsReviewError)
 from app.models.app import BundleModel
 from app.models.user import UserOrderModel, UsersCopyModel, UserProfileModel, UserProfileBundleModel
 from app.repo import UserRepo, UserOrderRepo, UserProfileRepo, UserProfileBundleRepo
+from app.repo.user_order_repo import OrderFulfilmentLock
 from app.repo.bundle_repo import BundleRepo
 from app.repo.bundle_tage_repo import BundleTagRepo
 from app.repo.tag_repo import TagRepo
@@ -40,6 +42,7 @@ class BundleService:
         self.__currency_service = CurrencyService()
         self.__user_repo = UserRepo()
         self.__user_order_repo = UserOrderRepo()
+        self.__fulfilment_lock = OrderFulfilmentLock(self.__user_order_repo)
         self.__user_profile_repo = UserProfileRepo()
         self.__user_profile_bundle_repo = UserProfileBundleRepo()
         self.__promotion_service = PromotionService()
@@ -194,13 +197,55 @@ class BundleService:
         discount_amount = self.__get_discount_amount(promo_code) if promo_code else None
         discount_rate = self.__get_discount_rate(promo_code) if promo_code else None
         bundle_type = self.__bundle_type(code=bundle.bundle_code)
-        esim_hub_order = await self.__esim_hub_service.create_reseller_order(bundle_code=bundle.bundle_code,
+
+        hub_order_id = getattr(user_order, "esim_order_id", None)
+        existing_profile = self.__user_profile_repo.get_first_by({"user_order_id": user_order.id})
+        if hub_order_id and existing_profile:
+            existing_bundle = self.__user_profile_bundle_repo.get_first_by({"user_order_id": user_order.id})
+            if not existing_bundle:
+                # The eSIM exists and the profile exists, but the plan record does not: repair it
+                # instead of calling the order finished.
+                logger.warning(f"order {user_order.id} had no bundle record; repairing it")
+                self.__user_profile_bundle_repo.create({
+                    "user_id": user_order.user_id,
+                    "user_order_id": user_order.id,
+                    "user_profile_id": existing_profile.id,
+                    "esim_hub_order_id": hub_order_id,
+                    "iccid": existing_profile.iccid,
+                    "bundle_type": UserBundleType.PRIMARY_BUNDLE,
+                    "plan_started": False,
+                    "bundle_expired": False,
+                    "bundle_data": bundle.model_dump(),
+                })
+            logger.info(f"order {user_order.id} was already fulfilled as hub order "
+                        f"{hub_order_id}; nothing more to order")
+            return ResponseHelper.success_response()
+        if hub_order_id and not existing_profile:
+            # The hub order exists but our records do not, and the hub has no lookup by our
+            # identifier, so we cannot rebuild them safely.
+            raise FulfilmentNeedsReviewError(
+                f"order {user_order.id} has hub order {hub_order_id} but no profile")
+        # One database statement decides who may call the hub. It only succeeds for an order with
+        # no hub id whose previous attempt is finished or whose lease has expired, so a stale
+        # in-memory copy of the order cannot talk its way past it.
+        if not self.__fulfilment_lock.acquire(user_order.id):
+            raise FulfilmentNeedsReviewError(
+                f"order {user_order.id} is being fulfilled elsewhere or was left mid-fulfilment "
+                f"({unique_identifier}); not ordering again")
+        user_order.order_status = OrderStatusEnum.FULFILLING
+
+        try:
+            esim_hub_order = await self.__esim_hub_service.create_reseller_order(bundle_code=bundle.bundle_code,
                                                                              order_id=unique_identifier, user=user,
                                                                              payment_type=payment_type,
                                                                              new_price=new_price,
                                                                              discount_amount=discount_amount,
                                                                              discount_rate=discount_rate,
-                                                                             bundle_type=bundle_type)
+                                                                                 bundle_type=bundle_type)
+        except EsimHubUnknownOutcomeError as e:
+            # The order may exist at Monty. Leave the lock in place and quarantine it, so nothing
+            # orders again automatically.
+            raise FulfilmentNeedsReviewError(f"order {user_order.id} ({unique_identifier}): {e.details}")
 
         user_order.payment_status = payment_status
         user_order.payment_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -214,7 +259,13 @@ class BundleService:
             return BadRequestException("Payment failed")
         else:
             user_order.esim_order_id = esim_hub_order.orderId
-        self.__user_order_repo.update_by({"id": user_order.id}, data=user_order.model_dump(exclude={"id", "fulfilment_claimed_at"}))
+            # Persist the hub order id first and on its own: if anything below fails, a replay can
+            # see that Monty already delivered and will not order a second eSIM.
+            self.__user_order_repo.update_by({"id": user_order.id},
+                                             data={"esim_order_id": esim_hub_order.orderId})
+        # fulfilment_claimed_at is excluded: this stale copy must not release the lock.
+        self.__user_order_repo.update_by({"id": user_order.id},
+                                         data=user_order.model_dump(exclude={"id", "fulfilment_claimed_at"}))
         user_profile = self.__user_profile_repo.create({
             "user_id": user_id,
             "user_order_id": user_order.id,
@@ -250,10 +301,7 @@ class BundleService:
                                            user_id=user_order.user_id)
         user = self.__user_repo.get_by_id(record_id=user_order.user_id)
 
-        def task():
-            self.__send_email(user=user, user_profile=user_profile, bundle=bundle, user_order=user_order)
-
-        self.__task_executor.add_task(task)
+        self.__send_email(user=user, user_profile=user_profile, bundle=bundle, user_order=user_order)
         return ResponseHelper.success_response()
 
     async def top_up_bundle(self, bundle: BundleDTO, user_order: UserOrderModel, iccid: str, user_id: str,
@@ -266,6 +314,18 @@ class BundleService:
         primary_bundle: UserProfileBundleModel = self.__user_profile_bundle_repo.get_first_by(
             {"user_id": user_id, "iccid": iccid, "bundle_type": UserBundleType.PRIMARY_BUNDLE})
         bundle_type = self.__bundle_type(code=bundle.bundle_code)
+
+        if getattr(user_order, "esim_order_id", None):
+            existing = self.__user_profile_bundle_repo.get_first_by({"user_order_id": user_order.id})
+            if existing:
+                logger.info(f"top-up order {user_order.id} was already fulfilled; nothing to do")
+                return ResponseHelper.success_response()
+            raise FulfilmentNeedsReviewError(
+                f"top-up order {user_order.id} has hub order {user_order.esim_order_id} but no bundle record")
+        if not self.__fulfilment_lock.acquire(user_order.id):
+            raise FulfilmentNeedsReviewError(
+                f"top-up order {user_order.id} is being fulfilled elsewhere or was left "
+                f"mid-fulfilment ({order_id}); not ordering again")
         try:
             esim_hub_topup = await self.__esim_hub_service.create_reseller_topup(
                 esim_hub_order_id=user_profile.esim_hub_order_id,
@@ -274,6 +334,8 @@ class BundleService:
                 user=user,
                 payment_type=payment_type,
                 bundle_type=bundle_type)
+        except EsimHubUnknownOutcomeError as e:
+            raise FulfilmentNeedsReviewError(f"top-up order {user_order.id} ({order_id}): {e.details}")
         except Exception as e:
             esim_hub_topup = None
             logger.error(f"error while topping up bundle {str(e)}")
@@ -286,11 +348,14 @@ class BundleService:
             })
             logger.error(f"error while topping up bundle {user_order.id}")
             return BadRequestException("Payment failed")
+        # Record the hub order id first and alone, so a failure below can never look like
+        # "never ordered" to a replay.
+        self.__user_order_repo.update_by({"id": user_order.id}, {"esim_order_id": esim_hub_topup.orderId})
         self.__user_order_repo.update_by({"id": user_order.id}, {
             "order_status": OrderStatusEnum.SUCCESS,
             "payment_status": payment_status,
             "callback_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "esim_order_id": None
+            "esim_order_id": esim_hub_topup.orderId
         })
         self.__user_profile_bundle_repo.create({
             "user_id": user_order.user_id,

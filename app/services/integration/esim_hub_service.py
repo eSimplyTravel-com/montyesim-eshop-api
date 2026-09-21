@@ -6,7 +6,7 @@ from loguru import logger
 
 from app.config.api import EsimHubEndpoint
 from app.config.helper import get_config
-from app.exceptions import EsimHubException
+from app.exceptions import EsimHubUnknownOutcomeError, EsimHubException
 from app.models.user import UsersCopyModel
 from app.schemas.app import ExchangeRate
 from app.schemas.bundle import ConsumptionResponse
@@ -197,16 +197,24 @@ class EsimHubService:
             logger.debug(f"request body: {request_body}")
             logger.debug(f"response: {response}")
             if "success" not in response or response["success"] == False:
-                logger.error("Failed to create reseller Hub: {}".format(response["message"]))
+                # An explicit rejection: nothing was created, so the caller may safely retry.
+                logger.error("Failed to create reseller Hub: {}".format(response.get("message")))
                 return None
             response_data = response["data"]
             esim_order_id = response_data["orderId"]
-            activation_code = await self.get_activation_code(esim_order_id)
-            response_data["activationCode"] = activation_code
-            return EsimHubOrderResponse.model_validate(response_data)
+            try:
+                response_data["activationCode"] = await self.get_activation_code(esim_order_id)
+                return EsimHubOrderResponse.model_validate(response_data)
+            except Exception as e:
+                # The order EXISTS at this point. Losing it here must never look like "not created".
+                raise EsimHubUnknownOutcomeError(
+                    f"order {esim_order_id} created but could not be read back: {e}")
+        except EsimHubUnknownOutcomeError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to create reseller order: {str(e)}")
-            return None
+            # Timeout, connection reset, 5xx: the request may well have reached the hub.
+            logger.error(f"Failed to create reseller order (outcome unknown): {str(e)}")
+            raise EsimHubUnknownOutcomeError(str(e))
 
     async def create_reseller_topup(self, bundle_code: str, esim_hub_order_id,
                                     order_id: str, user: UsersCopyModel,

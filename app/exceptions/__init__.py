@@ -28,6 +28,22 @@ class BadRequestException(CustomException):
         super().__init__(code=400, name=ErrorMessages.REQUEST_FAILED, details=details)
 
 
+class EsimHubUnknownOutcomeError(CustomException):
+    """The order may or may not have been created at the eSIM Hub: a timeout, a transport error or
+    a 5xx. Callers must NOT resubmit — the hub has no lookup by our identifier."""
+
+    def __init__(self, details: str):
+        super().__init__(code=409, name=ErrorMessages.ESIM_HUB_EXCEPTION, details=details)
+
+
+class FulfilmentNeedsReviewError(CustomException):
+    """A paid order whose eSIM Hub outcome is unknown. Never retried automatically: ordering again
+    could buy a second eSIM, so it is parked for a human to reconcile in the Monty portal."""
+
+    def __init__(self, details: str):
+        super().__init__(code=409, name=ErrorMessages.REQUEST_FAILED, details=details)
+
+
 class DatabaseException(CustomException):
     def __init__(self, details: str):
         super().__init__(code=400, name=ErrorMessages.REQUEST_FAILED, details=details)

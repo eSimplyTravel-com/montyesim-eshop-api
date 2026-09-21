@@ -267,6 +267,8 @@ def test_first_delivery_of_a_pending_order_still_runs(service):
     from app.models.user import OrderStatusEnum
     service._CallbackService__stripe_event_repo.claim.return_value = "tok"
     service._CallbackService__user_order_repo = MagicMock()
+    service._CallbackService__user_profile_repo = MagicMock()
+    service._CallbackService__user_profile_repo.get_first_by.return_value = None
     service._CallbackService__user_order_repo.get_by_id.return_value = MagicMock(
         payment_status=OrderStatusEnum.PENDING)
     event = {"id": "evt_1", "type": "payment_intent.succeeded",
@@ -303,6 +305,7 @@ def test_guard_refuses_to_run_fulfilment_when_the_order_cannot_be_read(service):
     service._CallbackService__stripe_event_repo.claim.return_value = "tok"
     service._CallbackService__stripe_event_repo.mark_failed.return_value = "failed"
     service._CallbackService__user_order_repo = MagicMock()
+    service._CallbackService__user_profile_repo = MagicMock()
     service._CallbackService__user_order_repo.get_by_id.side_effect = Exception("db down")
     event = {"id": "evt_1", "type": "payment_intent.succeeded",
              "data": {"object": {"metadata": {"order_id": "ord_1"}}}}
@@ -316,6 +319,8 @@ def test_paid_order_that_monty_never_fulfilled_is_retried(service):
     from app.models.user import OrderStatusEnum
     service._CallbackService__stripe_event_repo.claim.return_value = "tok"
     service._CallbackService__user_order_repo = MagicMock()
+    service._CallbackService__user_profile_repo = MagicMock()
+    service._CallbackService__user_profile_repo.get_first_by.return_value = None
     # payment succeeded, but the hub call failed: payment_status is success anyway
     service._CallbackService__user_order_repo.get_by_id.return_value = MagicMock(
         payment_status=OrderStatusEnum.SUCCESS, order_status=OrderStatusEnum.FAILURE, esim_order_id=None)
@@ -331,6 +336,8 @@ def test_order_already_delivered_by_monty_is_not_ordered_again(service):
     from app.models.user import OrderStatusEnum
     service._CallbackService__stripe_event_repo.claim.return_value = "tok"
     service._CallbackService__user_order_repo = MagicMock()
+    service._CallbackService__user_profile_repo = MagicMock()
+    service._CallbackService__user_profile_repo.get_first_by.return_value = MagicMock(id="prof_1")
     service._CallbackService__user_order_repo.get_by_id.return_value = MagicMock(
         payment_status=OrderStatusEnum.SUCCESS, order_status=OrderStatusEnum.SUCCESS,
         esim_order_id="hub_123")
