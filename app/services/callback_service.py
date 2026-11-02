@@ -345,12 +345,19 @@ class CallbackService:
         return ResponseHelper.success_response()
 
     async def __run_one_sync_internal(self, bundle_id: str, operation: str, reseller_id: str = None):
-        """Internal method that actually performs tkhe sync work - called by queue processor"""
+        """Internal method that actually performs tkhe sync work - called by queue processor.
+
+        The app cache key is only bumped when something was actually written. Monty
+        re-sends its catalogue as thousands of "update" callbacks per hour; bumping on
+        each one emptied the home/bundle cache continuously and pushed every page view
+        to the database (outage 28 Oct - 2 Nov 2026)."""
+        changed = False
         try:
             if reseller_id and reseller_id == get_config("RESELLER_ID"):
                 if operation == "delete":
                     logger.info(f"deleting bundle {bundle_id} for reseller {reseller_id}")
                     await self.__sync_service.delete_bundle(bundle_id=bundle_id)
+                    changed = True
                 elif operation == "assign" or operation == "edit_price":
                     logger.info(f"{operation} for bundle {bundle_id} for reseller {reseller_id}")
                     bundle = await self.__esim_hub_service.get_bundle_by_id(bundle_id=bundle_id,
@@ -358,30 +365,39 @@ class CallbackService:
                     if not bundle:
                         logger.error(f"bundle {bundle_id} not found in esim hub for reseller {reseller_id}")
                         await self.__sync_service.delete_bundle(bundle_id=bundle_id)
-                        return
-                    await self.__sync_service.sync_bundle(bundle)
+                        changed = True
+                    else:
+                        changed = await self.__sync_service.sync_bundle(bundle)
                 elif operation == "unassign":
                     logger.info(f"unassigning bundle {bundle_id} for reseller {reseller_id}")
                     await self.__sync_service.delete_bundle(bundle_id=bundle_id)
+                    changed = True
                 elif operation == "activate":
                     logger.info(f"activating bundle {bundle_id} for reseller {reseller_id}")
                     await self.__sync_service.update_bundle_status(bundle_id=bundle_id, status=True)
+                    changed = True
                 elif operation == "deactivate":
                     logger.info(f"deactivating bundle {bundle_id} for reseller {reseller_id}")
                     await self.__sync_service.delete_bundle(bundle_id=bundle_id)
+                    changed = True
             if operation == "update":
-                await self.__sync_service.delete_bundle(bundle_id=bundle_id)
-                bundle = None
+                # Fetch first, then decide. The old flow deactivated the bundle before
+                # fetching, so every update wrote twice and a transient hub error left a
+                # sellable bundle switched off.
                 try:
                     bundle = await self.__esim_hub_service.get_bundle_by_id(bundle_id=bundle_id,
                                                                             currency_code=os.getenv("DEFAULT_CURRENCY"))
                 except Exception as e:
-                    logger.error(f"error while fetching bundle {bundle_id} from esim hub: {str(e)}")
-                finally:
+                    logger.error(f"error while fetching bundle {bundle_id} from esim hub, leaving it as stored: {str(e)}")
+                    bundle = None
+                else:
                     if bundle:
                         logger.info(f"updating bundle {bundle_id} for reseller {reseller_id}")
-                        await self.__sync_service.sync_bundle(bundle)
-            self.__sync_service.update_sync_version()
+                        changed = await self.__sync_service.sync_bundle(bundle) or changed
+                    else:
+                        changed = await self.__sync_service.deactivate_if_present(bundle_id=bundle_id) or changed
+            if changed:
+                self.__sync_service.update_sync_version()
         except Exception as e:
             logger.error(f"error while syncing bundle {bundle_id}: {str(e)}")
             raise  # Re-raise so the queue processor can log it
